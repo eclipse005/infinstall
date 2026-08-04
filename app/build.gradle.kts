@@ -81,7 +81,8 @@ dependencies {
     // Network debugging / wireless pair+connect (impl detail, not product branding)
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
     implementation("org.conscrypt:conscrypt-android:2.5.3")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+    // Align with libadb-android's bcprov-jdk15to18 to avoid duplicate classes
+    implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
