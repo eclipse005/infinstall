@@ -46,6 +46,16 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += setOf(
+                "META-INF/LICENSE.md",
+                "META-INF/LICENSE.txt",
+                "META-INF/LICENSE",
+                "META-INF/LICENSE-notice.md",
+                "META-INF/NOTICE.md",
+                "META-INF/NOTICE.txt",
+                "META-INF/NOTICE",
+                "META-INF/*.kotlin_module",
+            )
         }
     }
 }
@@ -69,7 +79,12 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     // ADB protocol over TCP — implementation detail, not product branding
-    implementation("dev.mobile:dadb:1.2.9")
+    implementation("dev.mobile:dadb:1.2.9") {
+        exclude(group = "org.junit.jupiter")
+        exclude(group = "org.junit.platform")
+        exclude(group = "org.junit.vintage")
+        exclude(group = "junit")
+    }
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
