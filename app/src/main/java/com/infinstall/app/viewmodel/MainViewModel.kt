@@ -748,7 +748,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                // Fallback: show basic props from list item so user always gets feedback
                 val basic = RemoteFileProps(
                     path = file.fullPath(_ui.value.remotePath),
                     name = file.name,
@@ -767,7 +766,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     it.copy(
                         propsLoading = false,
                         fileProps = basic,
-                        filesBanner = "详细属性读取失败：${t.message ?: "错误"}（已显示基本信息）",
+                        // Only banner if we have zero info; otherwise just show sheet
+                        filesBanner = if (file.size <= 0 && file.permissions == "?") {
+                            "属性不完整：${t.message ?: "请重试"}"
+                        } else null,
                     )
                 }
             }

@@ -284,95 +284,64 @@ class TvSession(private val appContext: Context) {
     }
 
     /**
-     * List directory with a single simple command (ls -1Ap).
-     * Complex multi-line shell scripts were causing "Stream closed" on many devices.
+     * List via `ls -lA` so we get size/permissions in one reliable command.
+     * (ls -1Ap had no sizes — all showed 0.)
      */
     suspend fun listDir(path: String): List<RemoteFile> = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
             val p = normalizePath(path)
-            // -1 one per line, -A almost all, -p append / to dirs
-            val out = shell("ls -1Ap ${shellQuote(p)}", 20_000)
-            if (out.contains("No such file") || out.contains("Not a directory") ||
-                out.contains("Permission denied")
+            val out = shell("ls -lA ${shellQuote(p)}", 20_000)
+            val lower = out.lowercase()
+            if (lower.contains("no such file") || lower.contains("not a directory") ||
+                lower.contains("permission denied")
             ) {
-                error(out.lineSequence().firstOrNull()?.trim() ?: "无法打开目录")
+                error(out.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: "无法打开目录")
             }
             out.lineSequence()
-                .map { it.trim().trimEnd('\r') }
-                .filter { it.isNotEmpty() && it != "." && it != ".." }
-                .map { raw ->
-                    val isDir = raw.endsWith('/')
-                    val name = raw.trimEnd('/')
-                    RemoteFile(
-                        name = name,
-                        isDir = isDir,
-                        size = 0L,
-                        mtimeSec = 0L,
-                        permissions = "?",
-                        isLink = false,
-                    )
-                }
+                .map { it.trimEnd('\r') }
+                .mapNotNull { parseLsLongLine(it) }
                 .sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
                 .toList()
         }
     }
 
+    /**
+     * Props via single `ls -ld` — works on toybox without GNU stat -c.
+     */
     suspend fun statRemote(path: String): RemoteFileProps = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
             val p = path.trim()
-            // One short command chain — avoid multi-line scripts
-            val q = shellQuote(p)
-            val out = shell(
-                "if [ ! -e $q ]; then echo MISSING; else " +
-                    "echo OK; " +
-                    "if [ -d $q ]; then echo dir; elif [ -L $q ]; then echo link; elif [ -f $q ]; then echo file; else echo other; fi; " +
-                    "stat -c '%s' $q 2>/dev/null || echo 0; " +
-                    "stat -c '%Y' $q 2>/dev/null || echo 0; " +
-                    "stat -c '%A' $q 2>/dev/null || echo '?'; " +
-                    "stat -c '%U:%G' $q 2>/dev/null || echo '?'; " +
-                    "basename $q; " +
-                    "if [ -L $q ]; then readlink $q; else echo; fi; " +
-                    "if [ -r $q ]; then echo 1; else echo 0; fi; " +
-                    "if [ -w $q ]; then echo 1; else echo 0; fi; " +
-                    "fi",
-                12_000,
-            )
-            val rawLines = out.replace("\r\n", "\n").split('\n').map { it.trimEnd('\r') }
-            if (rawLines.firstOrNull()?.trim() == "MISSING") {
-                error("文件不存在")
+            val out = shell("ls -ld ${shellQuote(p)}", 12_000)
+            val line = out.lineSequence()
+                .map { it.trimEnd('\r').trim() }
+                .firstOrNull { it.isNotEmpty() && !it.startsWith("total") }
+                ?: error("无法读取属性")
+            if (line.lowercase().contains("no such file")) {
+                error("文件不存在：$p")
             }
-            if (rawLines.firstOrNull()?.trim() != "OK") {
-                error("无法读取属性：${out.take(120)}")
-            }
-            val type = rawLines.getOrNull(1)?.trim().orEmpty()
-            val size = rawLines.getOrNull(2)?.trim()?.toLongOrNull() ?: 0L
-            val mtime = rawLines.getOrNull(3)?.trim()?.toLongOrNull() ?: 0L
-            val perm = rawLines.getOrNull(4)?.trim().orEmpty().ifBlank { "?" }
-            val owner = rawLines.getOrNull(5)?.trim().orEmpty().ifBlank { "?" }
-            val name = rawLines.getOrNull(6)?.trim().orEmpty().ifBlank { p.substringAfterLast('/') }
-            val link = rawLines.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() }
-            val readable = rawLines.getOrNull(8)?.trim() == "1"
-            val writable = rawLines.getOrNull(9)?.trim() == "1"
+            val parsed = parseLsLongLine(line)
+                ?: error("无法解析属性：$line")
+            // name from ls -ld may be full path or basename
+            val displayName = p.trimEnd('/').substringAfterLast('/').ifBlank { parsed.name }
             RemoteFileProps(
                 path = p,
-                name = name,
-                isDir = type == "dir",
-                isLink = type == "link",
-                size = size,
-                mtimeSec = mtime,
-                permissions = perm,
-                owner = owner,
-                typeLabel = when (type) {
-                    "dir" -> "文件夹"
-                    "link" -> "链接"
-                    "file" -> "文件"
-                    else -> "其他"
+                name = displayName,
+                isDir = parsed.isDir,
+                isLink = parsed.isLink,
+                size = parsed.size,
+                mtimeSec = parsed.mtimeSec,
+                permissions = parsed.permissions,
+                owner = "?",
+                typeLabel = when {
+                    parsed.isDir -> "文件夹"
+                    parsed.isLink -> "链接"
+                    else -> "文件"
                 },
-                readable = readable,
-                writable = writable,
-                linkTarget = link,
+                readable = true,
+                writable = true,
+                linkTarget = null,
             )
         }
     }
@@ -380,10 +349,20 @@ class TvSession(private val appContext: Context) {
     suspend fun deleteRemote(path: String) = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
-            val q = shellQuote(path.trim())
-            val out = shell("rm -rf $q && echo __OK__", 25_000)
-            if (!out.contains("__OK__")) {
-                error(humanShellError("删除失败", out))
+            val p = path.trim()
+            // Use exec+sh for reliability; semicolon so OK still prints if rm warns
+            val out = shell("rm -rf ${shellQuote(p)}; echo __DEL_DONE__", 30_000)
+            Log.i(TAG, "delete $p => ${out.take(200)}")
+            if (!out.contains("__DEL_DONE__")) {
+                error(humanShellError("删除失败", out.ifBlank { "无返回（路径 $p）" }))
+            }
+            // If still exists, report
+            val check = shell("ls -ld ${shellQuote(p)} 2>&1; echo __CHK__", 10_000)
+            if (!check.contains("No such") && !check.contains("No such file") &&
+                check.lines().any { it.isNotBlank() && !it.contains("__CHK__") && it[0].let { c -> c == '-' || c == 'd' || c == 'l' } }
+            ) {
+                // still listed → permission or busy
+                error("删除失败：文件仍存在（可能无权限）\n$p")
             }
         }
     }
@@ -391,8 +370,7 @@ class TvSession(private val appContext: Context) {
     suspend fun mkdirRemote(path: String) = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
-            val q = shellQuote(path.trim())
-            val out = shell("mkdir -p $q && echo __OK__", 12_000)
+            val out = shell("mkdir -p ${shellQuote(path.trim())}; echo __OK__", 12_000)
             if (!out.contains("__OK__")) error(humanShellError("创建失败", out))
         }
     }
@@ -401,7 +379,7 @@ class TvSession(private val appContext: Context) {
         mutex.withLock {
             checkLinked()
             val out = shell(
-                "mv ${shellQuote(fromPath)} ${shellQuote(toPath)} && echo __OK__",
+                "mv ${shellQuote(fromPath)} ${shellQuote(toPath)}; echo __OK__",
                 20_000,
             )
             if (!out.contains("__OK__")) error(humanShellError("重命名失败", out))
@@ -412,7 +390,7 @@ class TvSession(private val appContext: Context) {
         mutex.withLock {
             checkLinked()
             val out = shell(
-                "cp -a ${shellQuote(fromPath)} ${shellQuote(toPath)} && echo __OK__",
+                "cp -a ${shellQuote(fromPath)} ${shellQuote(toPath)}; echo __OK__",
                 120_000,
             )
             if (!out.contains("__OK__")) error(humanShellError("复制失败", out))
@@ -423,11 +401,84 @@ class TvSession(private val appContext: Context) {
         mutex.withLock {
             checkLinked()
             val out = shell(
-                "mv ${shellQuote(fromPath)} ${shellQuote(toPath)} && echo __OK__",
+                "mv ${shellQuote(fromPath)} ${shellQuote(toPath)}; echo __OK__",
                 60_000,
             )
             if (!out.contains("__OK__")) error(humanShellError("移动失败", out))
         }
+    }
+
+    /**
+     * Parse a single `ls -l` / `ls -ld` line from Android toybox/toolbox.
+     *
+     * Examples:
+     *  -rw-rw---- 1 u0_a123 media_rw 29136 2024-08-04 03:14 file.apk
+     *  drwxrwx--x 2 u0_a123 media_rw  3452 2024-08-01 12:00 Download
+     *  -rw-r--r-- 1 root root 123 Jan  1  2020 old.txt
+     */
+    private fun parseLsLongLine(line: String): RemoteFile? {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("total", ignoreCase = true)) return null
+        if (trimmed.length < 10) return null
+        val mode = trimmed.substringBefore(' ')
+        if (mode.isEmpty()) return null
+        val typeChar = mode[0]
+        if (typeChar != '-' && typeChar != 'd' && typeChar != 'l' && typeChar != 'c' &&
+            typeChar != 'b' && typeChar != 'p' && typeChar != 's'
+        ) {
+            // not a long listing line
+            return null
+        }
+        val isDir = typeChar == 'd'
+        val isLink = typeChar == 'l'
+        val rest = trimmed.substring(mode.length).trim()
+        val tokens = rest.split(Regex("\\s+"))
+        if (tokens.size < 5) return null
+
+        // tokens: nlink owner group size date... name
+        // size is usually index 3
+        var sizeIdx = 3
+        var size = tokens.getOrNull(sizeIdx)?.toLongOrNull()
+        if (size == null) {
+            // find first pure number as size
+            sizeIdx = tokens.indexOfFirst { it.toLongOrNull() != null && it.length < 15 }
+            size = tokens.getOrNull(sizeIdx)?.toLongOrNull() ?: 0L
+        }
+        if (sizeIdx < 0) sizeIdx = 3
+
+        // date/time consume 2 or 3 tokens after size
+        var nameStart = sizeIdx + 1
+        if (nameStart < tokens.size) {
+            val t = tokens[nameStart]
+            when {
+                // 2024-08-04 03:14 name
+                t.matches(Regex("\\d{4}-\\d{2}-\\d{2}")) -> nameStart += 2
+                // Jan 1 2020 or Jan 1 03:14
+                t.matches(Regex("[A-Za-z]{3}")) -> nameStart += 3
+                else -> nameStart += 2
+            }
+        }
+        if (nameStart >= tokens.size) return null
+        var name = tokens.subList(nameStart, tokens.size).joinToString(" ")
+        // symlink: "name -> target"
+        if (isLink && " -> " in name) {
+            name = name.substringBefore(" -> ")
+        }
+        name = name.trim().trimEnd('/')
+        // ls -ld may show full path as name
+        if (name.contains('/')) {
+            name = name.substringAfterLast('/')
+        }
+        if (name.isEmpty() || name == "." || name == "..") return null
+
+        return RemoteFile(
+            name = name,
+            isDir = isDir,
+            size = if (isDir) 0L else size,
+            mtimeSec = 0L,
+            permissions = mode,
+            isLink = isLink,
+        )
     }
 
     private fun normalizePath(path: String): String {
@@ -597,9 +648,9 @@ class TvSession(private val appContext: Context) {
      * Nested timeouts previously left streams half-open → "Stream closed".
      */
     private fun shell(command: String, timeoutMs: Long): String {
-        // Collapse newlines — multi-line shell: payloads are unreliable over adb
-        val oneLine = command.replace("\n", " ").replace(Regex("\\s+"), " ").trim()
-        Log.d(TAG, "shell: ${oneLine.take(160)}")
+        // Only flatten newlines; do NOT collapse spaces (breaks quoted paths)
+        val oneLine = command.replace("\r", "").replace('\n', ' ').trim()
+        Log.i(TAG, "shell: ${oneLine.take(200)}")
         return callTimed(timeoutMs) {
             var stream: AdbStream? = null
             try {
