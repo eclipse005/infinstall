@@ -50,16 +50,22 @@ class AdbTransport(
     // ═══════ shell (commands only) ═══════
 
     /**
-     * Official `shell:command` service.
-     * SERVICES.md: args space-separated; spaces in args use double-quotes.
-     * We pass a single command line to the device shell.
+     * Run a shell command on the device.
+     *
+     * **CRITICAL libadb 3.1.1 workaround** ([issue #25](https://github.com/MuntashirAkon/libadb-android/issues/25)):
+     * `AdbProtocol.generateOpen` under-allocates and throws [java.nio.BufferOverflowException]
+     * when the OPEN destination is longer than ~104 bytes. Putting the full command in
+     * `shell:long-command…` (e.g. delete with Chinese paths) always hits this.
+     *
+     * Official-safe approach: open short destination `shell:` only, write the command
+     * to the stream (same as an interactive adb shell), then read until end marker.
      */
     fun shell(command: String, timeoutMs: Long): String {
         ensureLive()
         val cmd = command.replace("\r", "").replace('\n', ' ').trim()
         val marker = "__INF_END__"
-        // Device shell runs: cmd; echo marker
-        val full = "$cmd; echo $marker"
+        // One line + marker + exit so the remote shell terminates cleanly
+        val script = "$cmd; echo $marker; exit\n"
         Log.i(TAG, "shell(${timeoutMs}ms) ${cmd.take(160)}")
 
         var last: Throwable? = null
@@ -68,8 +74,11 @@ class AdbTransport(
                 return timed(timeoutMs) {
                     var stream: AdbStream? = null
                     try {
-                        // Official form: shell:command…
-                        stream = openStreamOnce("shell:$full")
+                        // Destination MUST stay short: "shell:" only (6 bytes)
+                        stream = openStreamOnce("shell:")
+                        val os = stream.openOutputStream()
+                        os.write(script.toByteArray(StandardCharsets.UTF_8))
+                        os.flush()
                         readUntilMarker(stream, marker, 4 * 1024 * 1024)
                     } finally {
                         closeQuiet(stream)
@@ -79,6 +88,15 @@ class AdbTransport(
             } catch (t: Throwable) {
                 last = t
                 if (t is TransferCancelledException) throw t
+                // Surface libadb OPEN bug clearly if it still appears (e.g. other long dest)
+                if (t is java.nio.BufferOverflowException ||
+                    t.cause is java.nio.BufferOverflowException
+                ) {
+                    throw AdbException(
+                        "ADB 通道缓冲错误（命令过长或库缺陷）。请重试；若持续失败请断开重连。",
+                        t,
+                    )
+                }
                 if (isTransientStreamError(t) && attempt == 0) {
                     Log.w(TAG, "shell retry after: ${t.message}")
                     Thread.sleep(100)

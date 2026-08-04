@@ -37,11 +37,15 @@ UI / MainViewModel
 2. 再次 connect 前清理  
 3. 确定性 TCP 死亡（reset 等）— **不含** Stream closed  
 
-## Shell 规则（SERVICES.md）
+## Shell 规则（SERVICES.md + libadb 限制）
 
-- `shell:command…`  
-- 单次 openStream + 结束标记  
+- **禁止** `openStream("shell:" + 长命令)`  
+  - libadb 3.1.1 bug：destination ≥ ~104 字节 → `BufferOverflowException`（issue #25）  
+  - 中文路径删除极易触发  
+- **正确做法**：`openStream("shell:")`，再把命令写入 OutputStream，读到 `__INF_END__`  
+- 文件操作优先 `sync:`（destination 很短）  
 - 可瞬时重试 1 次；不拆会话  
+
 
 ## 文件规则（SYNC）
 

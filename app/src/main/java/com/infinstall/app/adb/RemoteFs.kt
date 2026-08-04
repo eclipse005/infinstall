@@ -63,26 +63,32 @@ class RemoteFs(private val session: AdbSession) {
         }
     }
 
-    /** Shell only — single openStream. */
+    /**
+     * Shell only. Command is written into interactive `shell:` stream
+     * (never as long openStream destination — libadb BufferOverflow).
+     * Verify with sync STAT when possible.
+     */
     suspend fun delete(path: String) = withContext(Dispatchers.IO) {
         val p = path.trim()
         val qp = session.q(p)
-        val out = session.shell(
-            "rm -rf $qp; if [ -e $qp ] || [ -L $qp ]; then echo __STILL__; else echo __GONE__; fi",
-            30_000,
-        )
-        when {
-            out.contains("__GONE__") -> return@withContext
-            out.contains("__STILL__") ->
+        val out = session.shell("rm -rf $qp; echo __EC:\$?", 30_000)
+        val lower = out.lowercase()
+        if ("permission denied" in lower || "read-only" in lower) {
+            throw AdbException(cleanErr("删除失败", out, p))
+        }
+        // Prefer official sync STAT to confirm gone (short openStream: "sync:")
+        try {
+            val st = session.syncStat(p)
+            // Non-existent files typically return mode=0,size=0,mtime=0
+            if (st.mode != 0 || st.size != 0L) {
                 throw AdbException("删除失败（文件仍在，可能无权限）\n$p")
-            out.contains("Permission denied", ignoreCase = true) ||
-                out.contains("Read-only", ignoreCase = true) ->
-                throw AdbException(cleanErr("删除失败", out, p))
-            else -> {
-                val lower = out.lowercase()
-                if ("permission" in lower || "read-only" in lower || "failed" in lower) {
-                    throw AdbException(cleanErr("删除失败", out, p))
-                }
+            }
+        } catch (t: Throwable) {
+            if (t is AdbException && t.message?.contains("仍在") == true) throw t
+            // STAT failed / ambiguous — if rm printed no error, accept
+            val ec = Regex("""__EC:(\d+)""").find(out)?.groupValues?.get(1)
+            if (ec != null && ec != "0") {
+                throw AdbException(cleanErr("删除失败", out, p) + " [ec=$ec]")
             }
         }
     }

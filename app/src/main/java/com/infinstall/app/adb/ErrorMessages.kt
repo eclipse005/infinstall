@@ -36,6 +36,8 @@ object ErrorMessages {
         }
 
         return when {
+            "bufferoverflow" in msg.replace(" ", "") || "buffer overflow" in msg ->
+                "ADB 通道缓冲错误（路径/命令过长）。请重试；若仍失败请断开后重新连接。"
             "stream closed" in msg || "stream cos" in msg ||
                 ("closed" in msg && "stream" in msg) ||
                 "通道瞬时" in direct ->
