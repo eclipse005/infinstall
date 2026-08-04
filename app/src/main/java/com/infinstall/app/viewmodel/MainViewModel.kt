@@ -291,41 +291,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun startHeartbeat() {
+        // Heartbeat shell probes were still racing with file ops and killing the session.
+        // Only mark disconnected when an actual user operation reports connection loss,
+        // or when manager reports not connected after a failed op.
         stopHeartbeat()
         heartbeatJob = viewModelScope.launch {
-            var failCount = 0
-            // Wait longer after connect before first probe (session still settling)
-            delay(8_000)
             while (isActive) {
-                if (!_ui.value.connected) {
-                    delay(3_000)
+                delay(15_000)
+                if (!_ui.value.connected) continue
+                if (_ui.value.installing || _ui.value.transferring || _ui.value.filesLoading ||
+                    _ui.value.propsLoading
+                ) {
                     continue
                 }
-                // Skip probe while transferring — mutex busy & device under load
-                if (_ui.value.installing || _ui.value.transferring) {
-                    failCount = 0
-                    delay(4_000)
-                    continue
+                // Soft check only — never open competing streams under load
+                if (!session.isSessionUp()) {
+                    markRemoteGone("连接已失效，请重新连接")
+                    break
                 }
-                // In-band only: second TCP connect to adbd is refused on many devices
-                // and was causing immediate false "设备已断开".
-                val alive = try {
-                    session.isSessionUp() && session.pingInBand()
-                } catch (_: Throwable) {
-                    false
-                }
-                if (!alive) {
-                    failCount++
-                    Log.w("Infinstall", "heartbeat fail #$failCount")
-                    // Need several fails; one glitch must not drop the session
-                    if (failCount >= 4) {
-                        markRemoteGone("设备连接已丢失，请重新连接")
-                        break
-                    }
-                } else {
-                    failCount = 0
-                }
-                delay(5_000)
             }
         }
     }
@@ -632,14 +615,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!session.isConnected) return
         viewModelScope.launch {
             val path = file.fullPath(_ui.value.remotePath)
+            _ui.update { it.copy(filesBanner = "正在删除 ${file.name}…", filesLoading = true) }
             try {
                 withTimeout(30_000) { session.deleteRemote(path) }
-                _ui.update { it.copy(filesBanner = "已删除 ${file.name}") }
+                _ui.update { it.copy(filesBanner = "已删除 ${file.name}", filesLoading = false) }
                 refreshFiles()
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                if (!session.isSessionUp()) markRemoteGone("设备已断开")
-                else _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+                // Do NOT drop whole session on one failed delete — only if session really gone
+                val msg = ErrorMessages.humanize(t)
+                _ui.update { it.copy(filesBanner = msg, filesLoading = false) }
+                if (!session.isSessionUp()) {
+                    markRemoteGone("连接已失效，请重新连接")
+                }
             }
         }
     }
@@ -736,20 +724,50 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadProps(file: RemoteFile) {
-        if (!session.isConnected) return
+        if (!session.isConnected) {
+            _ui.update { it.copy(filesBanner = "未连接设备") }
+            return
+        }
         viewModelScope.launch {
-            _ui.update { it.copy(propsLoading = true, fileProps = null) }
+            _ui.update {
+                it.copy(
+                    propsLoading = true,
+                    fileProps = null,
+                    filesBanner = "正在读取属性…",
+                )
+            }
             try {
                 val path = file.fullPath(_ui.value.remotePath)
                 val props = withTimeout(15_000) { session.statRemote(path) }
-                _ui.update { it.copy(propsLoading = false, fileProps = props) }
-            } catch (t: Throwable) {
-                if (t is CancellationException) throw t
                 _ui.update {
                     it.copy(
                         propsLoading = false,
-                        fileProps = null,
-                        filesBanner = ErrorMessages.humanize(t),
+                        fileProps = props,
+                        filesBanner = null,
+                    )
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                // Fallback: show basic props from list item so user always gets feedback
+                val basic = RemoteFileProps(
+                    path = file.fullPath(_ui.value.remotePath),
+                    name = file.name,
+                    isDir = file.isDir,
+                    isLink = file.isLink,
+                    size = file.size,
+                    mtimeSec = file.mtimeSec,
+                    permissions = file.permissions,
+                    owner = "?",
+                    typeLabel = if (file.isDir) "文件夹" else "文件",
+                    readable = true,
+                    writable = true,
+                    linkTarget = null,
+                )
+                _ui.update {
+                    it.copy(
+                        propsLoading = false,
+                        fileProps = basic,
+                        filesBanner = "详细属性读取失败：${t.message ?: "错误"}（已显示基本信息）",
                     )
                 }
             }
