@@ -1,0 +1,48 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/Infinstall-debug.apk
+          ls -lh dist/
+
+      # 上传 artifact。网页下载会是 zip（GitHub 限制），
+      # 本机用 scripts/fetch-apk.sh / gh run download 会自动解压出 APK。
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infinstall-debug
+          path: dist/Infinstall-debug.apk
+          if-no-files-found: error
+          retention-days: 14

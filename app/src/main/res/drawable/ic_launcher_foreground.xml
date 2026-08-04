@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple TV + arrow mark -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,38h48c3.3,0 6,2.7 6,6v28c0,3.3 -2.7,6 -6,6H30c-3.3,0 -6,-2.7 -6,-6V44c0,-3.3 2.7,-6 6,-6zM36,48v20h36V48H36zM48,80h12v6H48z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,22l10,12H44z" />
+</vector>
