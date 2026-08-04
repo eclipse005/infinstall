@@ -2,6 +2,7 @@ package com.infinstall.app
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -41,11 +42,11 @@ class MainActivity : ComponentActivity() {
         val uris = mutableListOf<Uri>()
         when (intent.action) {
             Intent.ACTION_SEND -> {
-                intent.getParcelableExtraCompat<Uri>(Intent.EXTRA_STREAM)?.let { uris.add(it) }
+                streamUri(intent)?.let { uris.add(it) }
                 intent.data?.let { uris.add(it) }
             }
             Intent.ACTION_SEND_MULTIPLE -> {
-                intent.getParcelableArrayListExtraCompat<Uri>(Intent.EXTRA_STREAM)?.let { uris.addAll(it) }
+                streamUriList(intent).forEach { uris.add(it) }
             }
             Intent.ACTION_VIEW -> {
                 intent.data?.let { uris.add(it) }
@@ -55,23 +56,23 @@ class MainActivity : ComponentActivity() {
             vm.installFromUris(uris.distinct())
         }
     }
-}
 
-@Suppress("DEPRECATION")
-private inline fun <reified T> Intent.getParcelableExtraCompat(key: String): T? {
-    return if (android.os.Build.VERSION.SDK_INT >= 33) {
-        getParcelableExtra(key, T::class.java)
-    } else {
-        getParcelableExtra(key) as? T
+    @Suppress("DEPRECATION")
+    private fun streamUri(intent: Intent): Uri? {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+        }
     }
-}
 
-@Suppress("DEPRECATION")
-private inline fun <reified T> Intent.getParcelableArrayListExtraCompat(key: String): ArrayList<T>? {
-    return if (android.os.Build.VERSION.SDK_INT >= 33) {
-        getParcelableArrayListExtra(key, T::class.java)
-    } else {
-        @Suppress("UNCHECKED_CAST")
-        getParcelableArrayListExtra(key) as? ArrayList<T>
+    @Suppress("DEPRECATION")
+    private fun streamUriList(intent: Intent): List<Uri> {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+        } else {
+            @Suppress("UNCHECKED_CAST")
+            (intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM) as? ArrayList<Uri>).orEmpty()
+        }
     }
 }

@@ -11,7 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
-import androidx.compose.material.icons.filled.InstallMobile
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.infinstall.app.ui.screens.AppsScreen
@@ -38,6 +39,18 @@ import com.infinstall.app.ui.theme.ContentMaxWidth
 import com.infinstall.app.ui.theme.TabletBreakpoint
 import com.infinstall.app.viewmodel.MainTab
 import com.infinstall.app.viewmodel.MainViewModel
+
+private data class NavItem(
+    val tab: MainTab,
+    val label: String,
+    val icon: ImageVector,
+)
+
+private val navItems = listOf(
+    NavItem(MainTab.Connect, "连接", Icons.Default.Tv),
+    NavItem(MainTab.Install, "安装", Icons.Default.Download),
+    NavItem(MainTab.Apps, "应用", Icons.Default.Apps),
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -69,11 +82,14 @@ fun InfinstallRoot(vm: MainViewModel) {
             bottomBar = {
                 if (!isTablet) {
                     NavigationBar {
-                        NavItems(
-                            selected = state.tab,
-                            onSelect = vm::selectTab,
-                            rail = false,
-                        )
+                        navItems.forEach { item ->
+                            NavigationBarItem(
+                                selected = state.tab == item.tab,
+                                onClick = { vm.selectTab(item.tab) },
+                                icon = { Icon(item.icon, contentDescription = item.label) },
+                                label = { Text(item.label) },
+                            )
+                        }
                     }
                 }
             },
@@ -86,11 +102,14 @@ fun InfinstallRoot(vm: MainViewModel) {
                 if (isTablet) {
                     NavigationRail {
                         Spacer(Modifier.height(12.dp))
-                        NavItems(
-                            selected = state.tab,
-                            onSelect = vm::selectTab,
-                            rail = true,
-                        )
+                        navItems.forEach { item ->
+                            NavigationRailItem(
+                                selected = state.tab == item.tab,
+                                onClick = { vm.selectTab(item.tab) },
+                                icon = { Icon(item.icon, contentDescription = item.label) },
+                                label = { Text(item.label) },
+                            )
+                        }
                     }
                 }
                 Surface(
@@ -142,37 +161,6 @@ fun InfinstallRoot(vm: MainViewModel) {
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun NavItems(
-    selected: MainTab,
-    onSelect: (MainTab) -> Unit,
-    rail: Boolean,
-) {
-    data class Item(val tab: MainTab, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector)
-    val items = listOf(
-        Item(MainTab.Connect, "连接", Icons.Default.Tv),
-        Item(MainTab.Install, "安装", Icons.Default.InstallMobile),
-        Item(MainTab.Apps, "应用", Icons.Default.Apps),
-    )
-    items.forEach { item ->
-        if (rail) {
-            NavigationRailItem(
-                selected = selected == item.tab,
-                onClick = { onSelect(item.tab) },
-                icon = { Icon(item.icon, contentDescription = item.label) },
-                label = { Text(item.label) },
-            )
-        } else {
-            NavigationBarItem(
-                selected = selected == item.tab,
-                onClick = { onSelect(item.tab) },
-                icon = { Icon(item.icon, contentDescription = item.label) },
-                label = { Text(item.label) },
-            )
         }
     }
 }
