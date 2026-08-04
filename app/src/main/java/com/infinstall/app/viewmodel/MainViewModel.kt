@@ -10,7 +10,9 @@ import com.infinstall.app.adb.RemoteFile
 import com.infinstall.app.adb.TvSession
 import com.infinstall.app.data.ConnectionHistoryStore
 import com.infinstall.app.data.HostEntry
+import com.infinstall.app.util.LocalNetwork
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +21,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 enum class MainTab {
@@ -36,6 +39,8 @@ data class UiState(
     val tab: MainTab = MainTab.Connect,
     val connectMode: ConnectMode = ConnectMode.Direct,
     val hostInput: String = "",
+    /** This phone's LAN IP, e.g. 192.168.1.105 — for hint under IP field */
+    val localIpv4: String? = null,
     val portInput: String = "5555",
     val pairPortInput: String = "",
     val pairCodeInput: String = "",
@@ -70,6 +75,35 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             historyStore.history.collect { list ->
                 _ui.update { it.copy(history = list) }
+            }
+        }
+        // Prefill IP with this phone's Wi‑Fi subnet (e.g. 192.168.1.) so user only edits last digits
+        viewModelScope.launch(Dispatchers.IO) {
+            val localIp = LocalNetwork.primaryIpv4(getApplication())
+            val suggested = LocalNetwork.suggestedHostInput(getApplication())
+            _ui.update { state ->
+                // Don't overwrite if user already typed or history restored something
+                val host = if (state.hostInput.isBlank()) suggested else state.hostInput
+                state.copy(hostInput = host, localIpv4 = localIp)
+            }
+        }
+    }
+
+    /** Re-detect Wi‑Fi IP (e.g. after switching network) and refresh default host if still empty/prefix-only. */
+    fun refreshLocalNetworkHint() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val localIp = LocalNetwork.primaryIpv4(getApplication())
+            val suggested = LocalNetwork.suggestedHostInput(getApplication())
+            _ui.update { state ->
+                val cur = state.hostInput.trim()
+                val shouldReplace =
+                    cur.isEmpty() ||
+                        cur.endsWith('.') ||
+                        (localIp != null && cur == LocalNetwork.subnetPrefix(localIp))
+                state.copy(
+                    localIpv4 = localIp,
+                    hostInput = if (shouldReplace && suggested.isNotEmpty()) suggested else state.hostInput,
+                )
             }
         }
     }

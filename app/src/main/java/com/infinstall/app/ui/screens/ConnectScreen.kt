@@ -70,10 +70,16 @@ fun ConnectScreen(
     onDisconnect: () -> Unit,
     onPickHistory: (HostEntry) -> Unit,
     onRemoveHistory: (HostEntry) -> Unit,
+    onRefreshLocalNetwork: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var showHelp by remember { mutableStateOf(false) }
     var showPair by remember { mutableStateOf(false) }
+
+    // Refresh subnet hint when opening connect page
+    LaunchedEffect(Unit) {
+        onRefreshLocalNetwork()
+    }
 
     // 失败提示需要配对时，自动展开配对区
     LaunchedEffect(state.errorMessage, state.connectMode) {
@@ -114,7 +120,17 @@ fun ConnectScreen(
                         onValueChange = onHostChange,
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("IP 地址") },
-                        placeholder = { Text("例如 192.168.1.8") },
+                        placeholder = {
+                            Text(state.localIpv4?.let { "本机网段，改最后一段" } ?: "例如 192.168.1.8")
+                        },
+                        supportingText = {
+                            val local = state.localIpv4
+                            if (local != null) {
+                                Text("本机 $local，同一 Wi‑Fi 下改最后一段为电视 IP")
+                            } else {
+                                Text("与电视同一 Wi‑Fi 时会自动填入网段")
+                            }
+                        },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Uri,

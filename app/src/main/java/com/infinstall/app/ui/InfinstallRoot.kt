@@ -143,6 +143,7 @@ fun InfinstallRoot(vm: MainViewModel) {
                                 onDisconnect = vm::disconnect,
                                 onPickHistory = { e -> vm.connect(e.host, e.port) },
                                 onRemoveHistory = vm::removeHistory,
+                                onRefreshLocalNetwork = vm::refreshLocalNetworkHint,
                                 modifier = contentModifier,
                             )
                             MainTab.Install -> InstallScreen(
