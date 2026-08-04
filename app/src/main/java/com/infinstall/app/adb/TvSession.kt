@@ -274,40 +274,51 @@ class TvSession(private val appContext: Context) {
         val tmp = ByteArray(8 * 1024)
         val deadline = System.currentTimeMillis() + maxWaitMs
         var lastDataAt = System.currentTimeMillis()
-        while (System.currentTimeMillis() < deadline) {
+        var done = false
+        while (!done && System.currentTimeMillis() < deadline) {
             val available = try {
                 input.available()
             } catch (_: Exception) {
-                break
+                -1
             }
-            if (available > 0) {
-                val toRead = minOf(tmp.size, available)
-                val n = input.read(tmp, 0, toRead)
-                if (n <= 0) break
-                buf.write(tmp, 0, n)
-                lastDataAt = System.currentTimeMillis()
-                val soFar = buf.toString(StandardCharsets.UTF_8.name())
-                if (soFar.contains("__INF_EOF__")) break
-            } else {
-                // no bytes ready — if we already have EOF marker or idle after data, stop
-                val soFar = buf.toString(StandardCharsets.UTF_8.name())
-                if (soFar.contains("__INF_EOF__")) break
-                if (buf.size() > 0 && System.currentTimeMillis() - lastDataAt > 800) {
-                    // try one blocking short read
-                    try {
-                        input.read(tmp, 0, 1).let { n ->
-                            if (n > 0) {
-                                buf.write(tmp, 0, n)
-                                lastDataAt = System.currentTimeMillis()
-                            } else {
-                                break
-                            }
-                        }
+            when {
+                available < 0 -> done = true
+                available > 0 -> {
+                    val toRead = minOf(tmp.size, available)
+                    val n = try {
+                        input.read(tmp, 0, toRead)
                     } catch (_: Exception) {
-                        break
+                        -1
                     }
-                } else {
-                    Thread.sleep(40)
+                    if (n <= 0) {
+                        done = true
+                    } else {
+                        buf.write(tmp, 0, n)
+                        lastDataAt = System.currentTimeMillis()
+                        if (buf.toString(StandardCharsets.UTF_8.name()).contains("__INF_EOF__")) {
+                            done = true
+                        }
+                    }
+                }
+                else -> {
+                    val soFar = buf.toString(StandardCharsets.UTF_8.name())
+                    if (soFar.contains("__INF_EOF__")) {
+                        done = true
+                    } else if (buf.size() > 0 && System.currentTimeMillis() - lastDataAt > 800) {
+                        val n = try {
+                            input.read(tmp, 0, 1)
+                        } catch (_: Exception) {
+                            -1
+                        }
+                        if (n > 0) {
+                            buf.write(tmp, 0, n)
+                            lastDataAt = System.currentTimeMillis()
+                        } else {
+                            done = true
+                        }
+                    } else {
+                        Thread.sleep(40)
+                    }
                 }
             }
         }
