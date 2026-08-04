@@ -22,9 +22,9 @@ enum class MainTab {
 }
 
 enum class ConnectMode {
-    /** Classic: IP + port (e.g. 5555 or wireless-debug connect port) */
+    /** Main path for TV/box: IP + port */
     Direct,
-    /** Android 11+ wireless debugging pairing code flow */
+    /** Secondary: pairing code (wireless debugging, uncommon for TVs) */
     Pair,
 }
 
@@ -163,7 +163,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         pairing = false,
-                        statusMessage = "配对成功。请切换到「直接连接」，用连接端口再连一次。",
+                        statusMessage = "配对成功。请在上方填写连接端口，再点「连接」。",
                         errorMessage = null,
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
