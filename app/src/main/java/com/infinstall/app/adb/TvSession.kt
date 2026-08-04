@@ -145,22 +145,38 @@ class TvSession(private val appContext: Context) {
     }
 
     /**
-     * Detect drop without using ADB shell (shell can hang).
-     * If TCP to host:port fails, remote debugging is almost certainly off.
+     * Whether we still believe the ADB session is up.
+     *
+     * IMPORTANT: Do NOT open a second TCP connection to the debug port while already
+     * connected — many adbd instances only allow one client; a probe connect is refused
+     * and was falsely reported as "设备已断开".
      */
-    fun isTcpAlive(): Boolean {
-        val h = host ?: return false
-        val p = port ?: return false
-        return try {
-            Socket().use { s ->
-                s.tcpNoDelay = true
-                s.connect(InetSocketAddress(h, p), 2_000)
-                true
-            }
-        } catch (_: Exception) {
+    fun isSessionUp(): Boolean {
+        return host != null && port != null && manager.isConnected
+    }
+
+    /**
+     * In-band liveness: run a tiny shell on the existing connection.
+     * If the session is busy (install/list holds the mutex), treat as alive.
+     */
+    suspend fun pingInBand(): Boolean = withContext(Dispatchers.IO) {
+        if (!isSessionUp()) return@withContext false
+        if (!mutex.tryLock()) return@withContext true
+        try {
+            val out = shell("echo ping_ok", 5_000)
+            out.contains("ping_ok")
+        } catch (t: Throwable) {
+            Log.w(TAG, "pingInBand failed: ${t.message}")
+            // Only declare dead if manager also dropped
+            manager.isConnected && false
             false
+        } finally {
+            mutex.unlock()
         }
     }
+
+    /** @deprecated use [isSessionUp] / [pingInBand] — name kept for call sites */
+    fun isTcpAlive(): Boolean = isSessionUp()
 
     /**
      * Install APK: push to /data/local/tmp then pm install, then verify.
@@ -472,11 +488,10 @@ class TvSession(private val appContext: Context) {
     // ————— internals —————
 
     private fun checkLinked() {
-        if (!manager.isConnected || host == null) error("未连接设备")
-        if (!isTcpAlive()) {
-            safeDisconnect()
-            error("连接已断开（设备可能已关闭网络调试）")
+        if (host == null || !manager.isConnected) {
+            error("未连接设备")
         }
+        // Do not open a second TCP socket here — that breaks single-client adbd.
     }
 
     private fun safeDisconnect() {

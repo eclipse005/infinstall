@@ -3,6 +3,7 @@ package com.infinstall.app.viewmodel
 import android.app.Application
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.infinstall.app.adb.ErrorMessages
@@ -293,20 +294,38 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         stopHeartbeat()
         heartbeatJob = viewModelScope.launch {
             var failCount = 0
+            // Wait longer after connect before first probe (session still settling)
+            delay(8_000)
             while (isActive) {
-                delay(2_000)
-                if (!_ui.value.connected) continue
-                // Always TCP probe (works even while install holds ADB mutex)
-                if (!session.isTcpAlive()) {
+                if (!_ui.value.connected) {
+                    delay(3_000)
+                    continue
+                }
+                // Skip probe while transferring — mutex busy & device under load
+                if (_ui.value.installing || _ui.value.transferring) {
+                    failCount = 0
+                    delay(4_000)
+                    continue
+                }
+                // In-band only: second TCP connect to adbd is refused on many devices
+                // and was causing immediate false "设备已断开".
+                val alive = try {
+                    session.isSessionUp() && session.pingInBand()
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!alive) {
                     failCount++
-                    // require 2 consecutive fails to reduce false positives during heavy transfer
-                    if (failCount >= 2) {
-                        markRemoteGone("设备已断开（网络调试可能已关闭）")
+                    Log.w("Infinstall", "heartbeat fail #$failCount")
+                    // Need several fails; one glitch must not drop the session
+                    if (failCount >= 4) {
+                        markRemoteGone("设备连接已丢失，请重新连接")
                         break
                     }
                 } else {
                     failCount = 0
                 }
+                delay(5_000)
             }
         }
     }
@@ -378,7 +397,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             try {
                 for ((index, uri) in uris.withIndex()) {
-                    if (!session.isTcpAlive()) {
+                    if (!session.isSessionUp()) {
                         markRemoteGone("传输中设备断开")
                         return@launch
                     }
@@ -419,7 +438,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         failed++
                         append(ErrorMessages.humanize(t))
-                        if (!session.isTcpAlive()) {
+                        if (!session.isSessionUp()) {
                             markRemoteGone("设备已断开")
                             return@launch
                         }
@@ -473,7 +492,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                if (!session.isTcpAlive()) {
+                if (!session.isSessionUp()) {
                     markRemoteGone("设备已断开")
                 } else {
                     _ui.update {
@@ -544,7 +563,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             try {
                 for (uri in uris) {
-                    if (!session.isTcpAlive()) {
+                    if (!session.isSessionUp()) {
                         markRemoteGone("传输中设备断开")
                         return@launch
                     }
@@ -619,7 +638,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 refreshFiles()
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                if (!session.isTcpAlive()) markRemoteGone("设备已断开")
+                if (!session.isSessionUp()) markRemoteGone("设备已断开")
                 else _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
             }
         }
