@@ -36,8 +36,10 @@ object ErrorMessages {
         }
 
         return when {
-            "stream closed" in msg || "stream cos" in msg || "closed" in msg && "stream" in msg ->
-                "连接通道已关闭，请点断开后重新连接再操作。"
+            "stream closed" in msg || "stream cos" in msg ||
+                ("closed" in msg && "stream" in msg) ||
+                "通道瞬时" in direct ->
+                "通道瞬时异常，请再点一次（一般不用重连）。"
             "pairing required" in msg || throwable is io.github.muntashirakon.adb.AdbPairingRequiredException ->
                 "需要先配对（展开配对码选项）。"
             "tls" in msg || "ssl" in msg || "conscrypt" in msg ->

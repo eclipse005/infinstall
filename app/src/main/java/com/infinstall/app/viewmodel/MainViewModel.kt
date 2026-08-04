@@ -621,16 +621,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!session.isConnected) return
         viewModelScope.launch {
             val path = file.fullPath(_ui.value.remotePath)
-            _ui.update { it.copy(filesBanner = "正在删除 ${file.name}…", filesLoading = true) }
+            // Optimistic remove so UI feels instant; refresh reconciles.
+            val prev = _ui.value.files
+            _ui.update {
+                it.copy(
+                    filesBanner = "正在删除 ${file.name}…",
+                    filesLoading = true,
+                    files = it.files.filterNot { f -> f.name == file.name },
+                )
+            }
             try {
                 session.deleteRemote(path)
                 _ui.update { it.copy(filesBanner = "已删除 ${file.name}", filesLoading = false) }
-                refreshFiles()
+                // Soft refresh — failure only updates banner, keeps session
+                try {
+                    val list = session.listDir(_ui.value.remotePath)
+                    _ui.update {
+                        it.copy(files = sortFiles(list, it.fileSort), filesLoading = false)
+                    }
+                } catch (refreshErr: Throwable) {
+                    if (refreshErr is CancellationException) throw refreshErr
+                    // Delete already done; don't scare user with refresh glitch as "通信失败"
+                    _ui.update {
+                        it.copy(
+                            filesLoading = false,
+                            filesBanner = "已删除 ${file.name}（列表刷新稍后重试）",
+                        )
+                    }
+                }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                // Single delete failure ≠ disconnect the whole session
+                // Restore list on hard delete failure
                 _ui.update {
-                    it.copy(filesBanner = ErrorMessages.humanize(t), filesLoading = false)
+                    it.copy(
+                        files = prev,
+                        filesBanner = ErrorMessages.humanize(t),
+                        filesLoading = false,
+                    )
                 }
             }
         }

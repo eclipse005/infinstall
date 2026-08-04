@@ -19,12 +19,12 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Byte-level ADB I/O. Serializes all streams with one mutex.
+ * Serial ADB I/O. Never tears down the session on timeout or a single stream error.
  *
- * Does **not** own connection lifecycle. On failure it throws [AdbException];
- * only when [openStream] proves the socket is gone does it call [onTransportDead].
- *
- * Never disconnects on timeout — timeout is an operation failure only.
+ * Shell strategy:
+ * - Prefer `exec:sh -c '…'` (cleaner lifecycle than `shell:` on many TV adbd)
+ * - End marker so we do not hang waiting for EOF
+ * - One automatic retry on transient stream failures
  */
 class AdbTransport(
     private val manager: InfinstallAdbManager,
@@ -44,6 +44,7 @@ class AdbTransport(
         if (cancelFlag.get()) throw TransferCancelledException()
     }
 
+    /** Single-quote for Android toybox/sh. */
     fun q(path: String): String = "'" + path.replace("'", "'\\''") + "'"
 
     suspend fun <T> withSerial(block: () -> T): T = mutex.withLock { block() }
@@ -51,26 +52,46 @@ class AdbTransport(
     // ── shell ──────────────────────────────────────────────
 
     /**
-     * Run a single-line shell command. Appends end marker so we do not hang on EOF.
-     * Caller must already hold session live.
+     * Run a single-line shell command. Must be called under [withSerial] (or hold the
+     * same logical lock via session).
      */
     fun shell(command: String, timeoutMs: Long): String {
         ensureLive()
         val cmd = command.replace("\r", "").replace('\n', ' ').trim()
         val marker = "__INF_END__"
-        val full = "$cmd; echo $marker"
-        Log.i(TAG, "shell(${timeoutMs}ms) ${cmd.take(160)}")
-        return timed(timeoutMs) {
-            var stream: AdbStream? = null
+        // Always end with marker; use ; so marker prints even if cmd fails.
+        val script = "$cmd; echo $marker"
+        Log.i(TAG, "shell(${timeoutMs}ms) ${cmd.take(180)}")
+
+        var last: Throwable? = null
+        // Retry once: first stream after a prior op often fails with "Stream closed" on TV adbd.
+        repeat(2) { attempt ->
             try {
-                stream = openStream("shell:$full")
-                readUntilMarker(stream, marker, 4 * 1024 * 1024)
+                return timed(timeoutMs) {
+                    var stream: AdbStream? = null
+                    try {
+                        stream = openStreamPreferExec(script)
+                        readUntilMarker(stream, marker, 4 * 1024 * 1024)
+                    } finally {
+                        closeQuiet(stream)
+                        // Brief settle — some adbd dislike back-to-back openStream.
+                        if (attempt == 0) Thread.sleep(40)
+                    }
+                }
             } catch (t: Throwable) {
+                last = t
+                if (t is TransferCancelledException || t is AdbException && t.message?.contains("未连接") == true) {
+                    throw mapIo(t)
+                }
+                if (isTransientStreamError(t) && attempt == 0) {
+                    Log.w(TAG, "shell attempt0 transient: ${t.message}; retry")
+                    Thread.sleep(120)
+                    return@repeat
+                }
                 throw mapIo(t)
-            } finally {
-                closeQuiet(stream)
             }
         }
+        throw mapIo(last ?: AdbException("通信失败"))
     }
 
     // ── push / pull ────────────────────────────────────────
@@ -93,7 +114,7 @@ class AdbTransport(
         val shCmd = "cat > ${q(remotePath)}"
         var stream: AdbStream? = null
         try {
-            stream = timed(15_000) { openStream("exec:sh -c ${q(shCmd)}") }
+            stream = timed(15_000) { openStreamPreferExec(shCmd) }
             timed(300_000) {
                 val os = stream!!.openOutputStream()
                 FileInputStream(local).use { fis ->
@@ -117,6 +138,7 @@ class AdbTransport(
             throw mapIo(t)
         } finally {
             closeQuiet(stream)
+            Thread.sleep(40)
         }
 
         checkCancel()
@@ -144,7 +166,8 @@ class AdbTransport(
 
         var stream: AdbStream? = null
         try {
-            stream = timed(15_000) { openStream("shell:cat ${q(remotePath)}") }
+            // cat binary via exec for better EOF
+            stream = timed(15_000) { openStreamPreferExec("cat ${q(remotePath)}") }
             timed(300_000) {
                 FileOutputStream(local).use { fos ->
                     val input = stream!!.openInputStream()
@@ -165,11 +188,12 @@ class AdbTransport(
             throw mapIo(t)
         } finally {
             closeQuiet(stream)
+            Thread.sleep(40)
         }
         if (!local.exists()) throw AdbException("下载失败")
     }
 
-    // ── manager connect helpers (called under session lock) ─
+    // ── manager connect helpers ────────────────────────────
 
     fun managerConnect(host: String, port: Int) {
         timed(30_000) {
@@ -197,12 +221,29 @@ class AdbTransport(
         if (!isSessionLive()) throw AdbException("未连接设备")
     }
 
-    private fun openStream(dest: String): AdbStream {
+    /**
+     * Prefer exec:sh -c 'script' — avoids interactive shell quirks.
+     * Fall back to shell: if exec open fails once.
+     */
+    private fun openStreamPreferExec(script: String): AdbStream {
+        val execDest = "exec:sh -c ${q(script)}"
+        return try {
+            openStreamOnce(execDest)
+        } catch (t: Throwable) {
+            if (isDefinitiveTransportDeath(t)) throw t
+            Log.w(TAG, "exec open failed (${t.message}), fallback shell:")
+            openStreamOnce("shell:$script")
+        }
+    }
+
+    private fun openStreamOnce(dest: String): AdbStream {
         return try {
             manager.openStream(dest)
         } catch (t: Throwable) {
+            Log.e(TAG, "openStream failed dest=${dest.take(80)}: ${t.javaClass.simpleName} ${t.message}")
+            // Only kill session on *connection-level* death — NOT "Stream closed"
+            // (that is usually a per-stream glitch after a prior op).
             if (isDefinitiveTransportDeath(t)) {
-                Log.e(TAG, "transport dead: ${t.message}")
                 onTransportDead(t.message ?: t.javaClass.simpleName)
             }
             throw t
@@ -210,30 +251,48 @@ class AdbTransport(
     }
 
     /**
-     * Only hard network/session death — not "permission denied", not "no such file".
+     * Connection is gone for good. Do NOT include "stream closed" — that is transient.
      */
     private fun isDefinitiveTransportDeath(t: Throwable): Boolean {
         val m = (t.message ?: "").lowercase()
+        // Explicitly exclude per-stream noise
+        if ("stream closed" in m || "stream cos" in m) return false
+        if (t is java.io.EOFException) return false
         return (
             "connection reset" in m ||
                 "broken pipe" in m ||
                 "not connected" in m ||
-                "socket closed" in m ||
                 "failed to connect" in m ||
-                ("closed" in m && "stream" in m) ||
-                t is java.net.SocketException ||
-                t is java.io.EOFException
+                "socket closed" in m ||
+                (t is java.net.SocketException && "reset" in m)
             )
+    }
+
+    private fun isTransientStreamError(t: Throwable): Boolean {
+        val m = (t.message ?: "").lowercase()
+        val name = t.javaClass.simpleName.lowercase()
+        return "closed" in m ||
+            "stream" in m ||
+            "reset" in m ||
+            "broken" in m ||
+            "timeout" in m ||
+            "eof" in name ||
+            t is java.io.IOException
     }
 
     private fun mapIo(t: Throwable): Throwable {
         if (t is TransferCancelledException || t is AdbException) return t
+        val detail = buildString {
+            append(t.javaClass.simpleName)
+            val m = t.message
+            if (!m.isNullOrBlank()) append(": ").append(m.take(160))
+        }
         val m = (t.message ?: "").lowercase()
         return when {
             "closed" in m ->
-                AdbException("通道忙或异常，请重试（会话保持连接）", t)
+                AdbException("通道瞬时异常，请再试一次（不必重连）\n$detail", t)
             else ->
-                AdbException(t.message ?: "通信失败", t)
+                AdbException("通信失败\n$detail", t)
         }
     }
 
@@ -274,7 +333,7 @@ class AdbTransport(
         }
     }
 
-    /** Timeout → operation error only. Never tears down the session. */
+    /** Timeout → operation error only. Never disconnects. */
     private fun <T> timed(timeoutMs: Long, block: () -> T): T {
         val f = pool.submit(Callable { block() })
         return try {

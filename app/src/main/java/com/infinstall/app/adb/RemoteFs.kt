@@ -68,12 +68,28 @@ class RemoteFs(private val session: AdbSession) {
 
     suspend fun delete(path: String) = withContext(Dispatchers.IO) {
         val p = path.trim()
-        val out = session.shell("rm -rf ${session.q(p)}; echo __EC:\$?", 30_000)
-        val check = session.shell("ls -ld ${session.q(p)} 2>&1; echo __EC:\$?", 8_000)
-        val stillThere = !check.contains("No such", ignoreCase = true) &&
-            check.lineSequence().any { LsParser.parseLongLine(it) != null }
-        if (stillThere) {
-            throw AdbException(cleanErr("删除失败（可能无权限）", out, p))
+        // ONE shell only: rm + existence check. Two shells in a row were a common
+        // "通信失败" source (2nd openStream → Stream closed on flaky TV adbd).
+        val qp = session.q(p)
+        val out = session.shell(
+            "rm -rf $qp; if [ -e $qp ] || [ -L $qp ]; then echo __STILL__; else echo __GONE__; fi",
+            30_000,
+        )
+        when {
+            out.contains("__GONE__") -> return@withContext
+            out.contains("__STILL__") ->
+                throw AdbException("删除失败（文件仍在，可能无权限）\n$p")
+            out.contains("Permission denied", ignoreCase = true) ||
+                out.contains("Read-only", ignoreCase = true) ->
+                throw AdbException(cleanErr("删除失败", out, p))
+            else -> {
+                // Ambiguous output: treat as soft success if no obvious error
+                // (some shells swallow [ -e ] noise). List refresh will reconcile.
+                val lower = out.lowercase()
+                if ("permission" in lower || "read-only" in lower || "failed" in lower) {
+                    throw AdbException(cleanErr("删除失败", out, p))
+                }
+            }
         }
     }
 
