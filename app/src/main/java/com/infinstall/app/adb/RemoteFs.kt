@@ -185,26 +185,6 @@ class RemoteFs(private val session: AdbSession) {
         return if (p != "/" && p.endsWith('/')) p.trimEnd('/') else p
     }
 
-    private fun exitCode(out: String): Int? {
-        val m = Regex("""__EC:(\d+)""").find(out) ?: return null
-        return m.groupValues[1].toIntOrNull()
-    }
-
-    private fun requireOk(out: String, prefix: String, path: String) {
-        val ec = exitCode(out)
-        when {
-            ec == 0 -> return
-            ec != null -> throw AdbException(cleanErr(prefix, out, path) + " [ec=$ec]")
-            else -> {
-                val lower = out.lowercase()
-                if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
-                    throw AdbException(cleanErr(prefix, out, path))
-                }
-                throw AdbException(cleanErr("$prefix（无退出码回执）", out, path))
-            }
-        }
-    }
-
     private fun cleanErr(prefix: String, out: String, path: String): String {
         val msg = out.lineSequence()
             .map { it.trim() }
