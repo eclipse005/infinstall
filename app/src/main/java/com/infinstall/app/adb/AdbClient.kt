@@ -64,7 +64,7 @@ class AdbClient private constructor(context: Context) {
         mutex.withLock {
             val h = host.trim()
             val c = code.filter { it.isDigit() }
-            require(c.length in 5..8) { "配对码应为 6 位数字" }
+            if (c.length !in 5..8) throw AdbException("配对码应为 6 位数字")
             tcpCheck(h, pairPort)
             try {
                 timed(60_000) {
@@ -295,13 +295,27 @@ class AdbClient private constructor(context: Context) {
         }
     }
 
+    /**
+     * Hard timeout for blocking I/O. On timeout we interrupt the worker; callers must
+     * still close AdbStreams in finally (shell/push/pull already do).
+     *
+     * Note: interrupt does not always unblock socket read — residual risk of a stuck
+     * worker until stream is closed by the calling finally / disconnect.
+     */
     private fun <T> timed(timeoutMs: Long, block: () -> T): T {
         val f = pool.submit(Callable { block() })
         return try {
             f.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             f.cancel(true)
-            throw AdbException("操作超时（${timeoutMs / 1000}s）")
+            // Best-effort: drop the session so a half-open stream cannot poison later ops.
+            try {
+                manager.disconnect()
+            } catch (_: Exception) {
+            }
+            host = null
+            port = null
+            throw AdbException("操作超时（${timeoutMs / 1000}s），请重新连接后再试")
         } catch (e: Exception) {
             val c = e.cause ?: e
             when (c) {

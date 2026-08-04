@@ -246,18 +246,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(pairing = true, errorMessage = null, connectBanner = "配对中…") }
             try {
                 withTimeout(60_000) { session.pair(h, pairPort, code) }
-                // After pair: connect port ≠ pair port. If user still has pair port (or blank)
-                // in the connect field, clear it so they re-enter the real connect port.
-                val curPort = _ui.value.portInput.toIntOrNull()
-                val needNewPort = curPort == null || curPort == pairPort
+                // After wireless pairing, connect port is NEVER the pair port, and usually
+                // NOT 5555 either — force re-entry of the port shown at top of 无线调试.
                 _ui.update {
                     it.copy(
                         pairing = false,
                         connectBanner = "配对成功！请填上方「连接端口」" +
-                            "（无线调试主页顶部，不是配对端口 $pairPort）后点连接",
+                            "（打开无线调试主页顶部 IP:端口，不是配对端口 $pairPort；也不是 5555）",
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
-                        portInput = if (needNewPort) "" else it.portInput,
+                        portInput = "",
                         errorMessage = null,
                         tab = MainTab.Connect,
                     )
@@ -299,14 +297,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         session.requestCancel()
         transferJob?.cancel()
         transferJob = null
-        _ui.update {
-            it.copy(
+        // Read flags BEFORE clearing — previously copy used already-false fields, so banners never updated.
+        _ui.update { s ->
+            val wasInstalling = s.installing
+            val wasTransferring = s.transferring
+            s.copy(
                 installing = false,
                 transferring = false,
                 transferProgress = null,
                 transferLabel = null,
-                installBanner = if (it.installing) "已取消安装" else it.installBanner,
-                filesBanner = if (it.transferring) "已取消传输" else it.filesBanner,
+                installBanner = if (wasInstalling) "已取消安装" else s.installBanner,
+                filesBanner = if (wasTransferring) "已取消传输" else s.filesBanner,
             )
         }
     }

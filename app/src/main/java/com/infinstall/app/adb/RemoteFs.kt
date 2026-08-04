@@ -155,14 +155,16 @@ class RemoteFs(private val client: AdbClient) {
 
     private fun requireOk(out: String, prefix: String, path: String) {
         val ec = exitCode(out)
-        if (ec != null && ec != 0) {
-            throw AdbException(cleanErr(prefix, out, path) + " [ec=$ec]")
-        }
-        // if marker missing, still fail on obvious errors
-        if (ec == null) {
-            val lower = out.lowercase()
-            if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
-                throw AdbException(cleanErr(prefix, out, path))
+        when {
+            ec == 0 -> return
+            ec != null -> throw AdbException(cleanErr(prefix, out, path) + " [ec=$ec]")
+            else -> {
+                // Marker missing = shell stream likely cut off; do not treat as success.
+                val lower = out.lowercase()
+                if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
+                    throw AdbException(cleanErr(prefix, out, path))
+                }
+                throw AdbException(cleanErr("$prefix（无退出码回执）", out, path))
             }
         }
     }
