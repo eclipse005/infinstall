@@ -131,17 +131,8 @@ fun AppsScreen(
             }
         }
 
-        state.errorMessage?.let { msg ->
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
-                }
-            }
-        }
-        state.statusMessage?.let { msg ->
+        // only apps-related banners — not global "已连接"
+        state.appsBanner?.let { msg ->
             item {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -160,12 +151,12 @@ fun AppsScreen(
                     modifier = Modifier.padding(vertical = 24.dp),
                 ) {
                     CircularProgressIndicator()
-                    Text("加载应用列表…", style = MaterialTheme.typography.bodyLarge)
+                    Text("加载中…", style = MaterialTheme.typography.bodyLarge)
                 }
             }
         }
 
-        if (state.connected && !state.appsLoading && state.apps.isEmpty()) {
+        if (state.connected && !state.appsLoading && state.apps.isEmpty() && state.appsBanner == null) {
             item {
                 Text(
                     "暂无第三方应用",

@@ -40,7 +40,6 @@ fun InstallScreen(
     onGoConnect: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // 一个入口：系统文件选择器，支持多选
     val picker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
     ) { uris ->
@@ -114,17 +113,8 @@ fun InstallScreen(
             }
         }
 
-        state.errorMessage?.let { msg ->
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
-                }
-            }
-        }
-        state.statusMessage?.let { msg ->
+        // only install-related banners — not "已连接"
+        state.installBanner?.let { msg ->
             item {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -135,9 +125,26 @@ fun InstallScreen(
             }
         }
 
+        if (state.tab == com.infinstall.app.viewmodel.MainTab.Install) {
+            state.errorMessage?.let { msg ->
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        }
+
         if (state.installLog.isNotEmpty()) {
             items(state.installLog) { line ->
-                Text(line, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    line,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
 

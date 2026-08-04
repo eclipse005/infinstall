@@ -9,11 +9,16 @@ import com.infinstall.app.adb.TvAppInfo
 import com.infinstall.app.adb.TvSession
 import com.infinstall.app.data.ConnectionHistoryStore
 import com.infinstall.app.data.HostEntry
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 enum class MainTab {
     Connect,
@@ -22,9 +27,7 @@ enum class MainTab {
 }
 
 enum class ConnectMode {
-    /** Main path for TV/box: IP + port */
     Direct,
-    /** Secondary: pairing code (wireless debugging, uncommon for TVs) */
     Pair,
 }
 
@@ -39,13 +42,16 @@ data class UiState(
     val pairing: Boolean = false,
     val connected: Boolean = false,
     val connectedEndpoint: String? = null,
-    val statusMessage: String? = null,
+    /** Connect-tab only messages (pair hints, disconnect notice). Not shown on Install/Apps. */
+    val connectBanner: String? = null,
     val errorMessage: String? = null,
     val history: List<HostEntry> = emptyList(),
     val installing: Boolean = false,
     val installLog: List<String> = emptyList(),
+    val installBanner: String? = null,
     val appsLoading: Boolean = false,
     val apps: List<TvAppInfo> = emptyList(),
+    val appsBanner: String? = null,
     val uninstallingPackage: String? = null,
 )
 
@@ -56,6 +62,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
+    private var heartbeatJob: Job? = null
+    private var appsJob: Job? = null
+    private var labelJob: Job? = null
+
     init {
         viewModelScope.launch {
             historyStore.history.collect { list ->
@@ -65,14 +75,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectTab(tab: MainTab) {
-        _ui.update { it.copy(tab = tab, errorMessage = null) }
+        _ui.update {
+            it.copy(
+                tab = tab,
+                // don't carry connection "已连接" onto other tabs
+                errorMessage = if (tab == MainTab.Connect) it.errorMessage else null,
+            )
+        }
         if (tab == MainTab.Apps && session.isConnected) {
-            refreshApps()
+            // only load if empty; avoid re-scan loop every time user opens tab
+            if (_ui.value.apps.isEmpty() && !_ui.value.appsLoading) {
+                refreshApps()
+            }
         }
     }
 
     fun setConnectMode(mode: ConnectMode) {
-        _ui.update { it.copy(connectMode = mode, errorMessage = null, statusMessage = null) }
+        _ui.update { it.copy(connectMode = mode, errorMessage = null, connectBanner = null) }
     }
 
     fun updateHost(value: String) {
@@ -99,13 +118,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         viewModelScope.launch {
+            stopHeartbeat()
+            appsJob?.cancel()
+            labelJob?.cancel()
             _ui.update {
                 it.copy(
                     connecting = true,
                     errorMessage = null,
-                    statusMessage = "正在连接 $h:$p …",
+                    connectBanner = "正在连接…",
                     hostInput = h,
                     portInput = p.toString(),
+                    apps = emptyList(),
                 )
             }
             try {
@@ -116,17 +139,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         connecting = false,
                         connected = true,
                         connectedEndpoint = "$h:$p",
-                        statusMessage = "已连接 $h:$p",
+                        // 顶部栏已显示已连接，这里不再重复「已连接」
+                        connectBanner = null,
                         errorMessage = null,
                     )
                 }
+                startHeartbeat()
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 _ui.update {
                     it.copy(
                         connecting = false,
                         connected = false,
                         connectedEndpoint = null,
-                        statusMessage = null,
+                        connectBanner = null,
                         errorMessage = ErrorMessages.humanize(t, h, p),
                     )
                 }
@@ -143,37 +169,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         if (pairPort == null || pairPort <= 0) {
-            _ui.update { it.copy(errorMessage = "请输入配对端口（在「使用配对码配对设备」界面上）。") }
+            _ui.update { it.copy(errorMessage = "请输入配对端口。") }
             return
         }
         if (code.length < 5) {
-            _ui.update { it.copy(errorMessage = "请输入设备上显示的配对码（一般为 6 位数字）。") }
+            _ui.update { it.copy(errorMessage = "请输入 6 位配对码。") }
             return
         }
         viewModelScope.launch {
             _ui.update {
-                it.copy(
-                    pairing = true,
-                    errorMessage = null,
-                    statusMessage = "正在配对 $h:$pairPort …",
-                )
+                it.copy(pairing = true, errorMessage = null, connectBanner = "正在配对…")
             }
             try {
                 session.pair(h, pairPort, code)
                 _ui.update {
                     it.copy(
                         pairing = false,
-                        statusMessage = "配对成功。请在上方填写连接端口，再点「连接」。",
+                        connectBanner = "配对成功，请填写连接端口后点「连接」",
                         errorMessage = null,
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
                     )
                 }
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 _ui.update {
                     it.copy(
                         pairing = false,
-                        statusMessage = null,
+                        connectBanner = null,
                         errorMessage = ErrorMessages.humanize(t, h, pairPort),
                     )
                 }
@@ -183,15 +206,65 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() {
         viewModelScope.launch {
+            stopHeartbeat()
+            appsJob?.cancel()
+            labelJob?.cancel()
             session.disconnect()
             _ui.update {
                 it.copy(
                     connected = false,
                     connectedEndpoint = null,
-                    statusMessage = "已断开连接",
+                    connectBanner = "已断开",
                     apps = emptyList(),
+                    appsLoading = false,
+                    installing = false,
                 )
             }
+        }
+    }
+
+    private fun startHeartbeat() {
+        stopHeartbeat()
+        heartbeatJob = viewModelScope.launch {
+            while (isActive) {
+                delay(3_500)
+                if (!_ui.value.connected) continue
+                if (_ui.value.installing) continue // don't interfere with transfer
+                val alive = try {
+                    session.ping()
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!alive) {
+                    markRemoteGone()
+                    break
+                }
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
+    private suspend fun markRemoteGone() {
+        stopHeartbeat()
+        appsJob?.cancel()
+        labelJob?.cancel()
+        runCatching { session.disconnect() }
+        _ui.update {
+            it.copy(
+                connected = false,
+                connectedEndpoint = null,
+                connectBanner = null,
+                apps = emptyList(),
+                appsLoading = false,
+                installing = false,
+                // surface on all tabs via error on current + connect banner
+                errorMessage = "设备已断开。可能已关闭网络调试，或网络中断。请重新连接。",
+                tab = MainTab.Connect,
+            )
         }
     }
 
@@ -207,19 +280,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update {
                 it.copy(
                     tab = MainTab.Connect,
-                    errorMessage = "请先连接设备，再安装应用。",
+                    errorMessage = "请先连接设备",
                 )
             }
             return
         }
+        // cancel heavy apps work so mutex is free for install
+        appsJob?.cancel()
+        labelJob?.cancel()
         viewModelScope.launch {
             _ui.update {
                 it.copy(
                     tab = MainTab.Install,
                     installing = true,
                     installLog = emptyList(),
+                    installBanner = null,
                     errorMessage = null,
-                    statusMessage = null,
+                    appsLoading = false,
                 )
             }
             val resolver = getApplication<Application>().contentResolver
@@ -230,58 +307,123 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { state -> state.copy(installLog = logs.toList()) }
             }
             var failed = 0
-            uris.forEachIndexed { index, uri ->
-                val name = uri.lastPathSegment?.substringAfterLast('/')
-                    ?: "应用 ${index + 1}.apk"
-                try {
-                    resolver.openInputStream(uri)?.use { input ->
-                        session.installApk(input, name, cacheDir) { status ->
-                            append(status)
-                        }
-                    } ?: run {
-                        failed++
-                        append("无法读取文件：$name")
-                    }
-                } catch (t: Throwable) {
-                    failed++
-                    append(ErrorMessages.humanize(t))
-                }
-            }
-            _ui.update {
-                it.copy(
-                    installing = false,
-                    statusMessage = if (failed == 0) {
-                        "安装完成（${uris.size}）"
-                    } else {
-                        "完成 ${uris.size - failed}，失败 $failed"
-                    },
-                )
-            }
-            if (session.isConnected) {
-                runCatching { refreshAppsInternal() }
-            }
-        }
-    }
-
-    fun refreshApps() {
-        viewModelScope.launch {
             try {
-                refreshAppsInternal()
-            } catch (t: Throwable) {
+                uris.forEachIndexed { index, uri ->
+                    if (!session.isConnected) {
+                        markRemoteGone()
+                        return@launch
+                    }
+                    val name = uri.lastPathSegment?.substringAfterLast('/')
+                        ?: "应用 ${index + 1}.apk"
+                    try {
+                        resolver.openInputStream(uri)?.use { input ->
+                            session.installApk(input, name, cacheDir) { status ->
+                                append(status)
+                            }
+                        } ?: run {
+                            failed++
+                            append("无法读取：$name")
+                        }
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        failed++
+                        append(ErrorMessages.humanize(t))
+                        if (!session.isConnected || t.message?.contains("断开") == true) {
+                            markRemoteGone()
+                            return@launch
+                        }
+                    }
+                }
                 _ui.update {
                     it.copy(
-                        appsLoading = false,
-                        errorMessage = ErrorMessages.humanize(t, session.host, session.port),
+                        installing = false,
+                        installBanner = if (failed == 0) {
+                            "安装完成（${uris.size}）"
+                        } else {
+                            "完成 ${uris.size - failed}，失败 $failed"
+                        },
+                    )
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update {
+                    it.copy(
+                        installing = false,
+                        installBanner = null,
+                        errorMessage = ErrorMessages.humanize(t),
                     )
                 }
             }
         }
     }
 
-    private suspend fun refreshAppsInternal() {
-        _ui.update { it.copy(appsLoading = true, errorMessage = null) }
-        val apps = session.listThirdPartyApps()
-        _ui.update { it.copy(appsLoading = false, apps = apps) }
+    fun refreshApps() {
+        if (!session.isConnected) return
+        appsJob?.cancel()
+        appsJob = viewModelScope.launch {
+            _ui.update {
+                it.copy(appsLoading = true, appsBanner = null, errorMessage = null)
+            }
+            try {
+                val apps = withTimeout(25_000) {
+                    session.listThirdPartyApps()
+                }
+                _ui.update {
+                    it.copy(
+                        appsLoading = false,
+                        apps = apps,
+                        appsBanner = if (apps.isEmpty()) "暂无第三方应用" else null,
+                    )
+                }
+                // background: improve a few labels without blocking UI
+                enrichLabels(apps)
+            } catch (t: Throwable) {
+                if (t is CancellationException) {
+                    _ui.update { it.copy(appsLoading = false) }
+                    throw t
+                }
+                val dead = !session.isConnected ||
+                    t.message?.contains("Not connected", ignoreCase = true) == true ||
+                    t.message?.contains("未连接", ignoreCase = true) == true
+                if (dead) {
+                    markRemoteGone()
+                } else {
+                    _ui.update {
+                        it.copy(
+                            appsLoading = false,
+                            appsBanner = "应用列表加载失败，可点刷新重试",
+                            errorMessage = null,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun enrichLabels(apps: List<TvAppInfo>) {
+        labelJob?.cancel()
+        labelJob = viewModelScope.launch {
+            // only first 30 to keep light
+            val updated = apps.toMutableList()
+            var changed = false
+            for (i in updated.indices) {
+                if (!isActive || !session.isConnected) break
+                if (_ui.value.installing) break
+                val app = updated[i]
+                val better = session.resolveLabel(app.packageName) ?: continue
+                if (better.isNotBlank() && better != app.label) {
+                    updated[i] = app.copy(label = better)
+                    changed = true
+                    if (changed && i % 3 == 0) {
+                        _ui.update { it.copy(apps = updated.sortedBy { a -> a.label.lowercase() }) }
+                    }
+                }
+                delay(50)
+            }
+            if (changed) {
+                _ui.update { it.copy(apps = updated.sortedBy { a -> a.label.lowercase() }) }
+            }
+        }
     }
 
     fun uninstall(packageName: String) {
@@ -295,17 +437,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     it.copy(
                         uninstallingPackage = null,
                         apps = apps,
-                        statusMessage = "已卸载 $packageName",
+                        appsBanner = "已卸载",
                     )
                 }
             } catch (t: Throwable) {
-                _ui.update {
-                    it.copy(
-                        uninstallingPackage = null,
-                        errorMessage = ErrorMessages.humanize(t, session.host, session.port),
-                    )
+                if (t is CancellationException) throw t
+                if (!session.isConnected) {
+                    markRemoteGone()
+                } else {
+                    _ui.update {
+                        it.copy(
+                            uninstallingPackage = null,
+                            appsBanner = ErrorMessages.humanize(t, session.host, session.port),
+                        )
+                    }
                 }
             }
         }
+    }
+
+    override fun onCleared() {
+        stopHeartbeat()
+        appsJob?.cancel()
+        labelJob?.cancel()
+        super.onCleared()
     }
 }

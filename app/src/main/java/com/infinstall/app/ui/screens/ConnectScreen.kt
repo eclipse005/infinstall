@@ -353,7 +353,7 @@ private fun StatusBlock(state: UiState) {
             )
         }
     }
-    state.statusMessage?.let { msg ->
+    state.connectBanner?.let { msg ->
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
