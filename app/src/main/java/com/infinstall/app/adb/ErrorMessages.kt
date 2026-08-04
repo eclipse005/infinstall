@@ -4,17 +4,25 @@ object ErrorMessages {
     fun humanize(throwable: Throwable, host: String? = null, port: Int? = null): String {
         // Prefer our wrapped messages (already Chinese + detail)
         val direct = throwable.message.orEmpty()
+        if (throwable is AdbException && direct.isNotBlank()) {
+            return direct
+        }
         if (direct.isNotBlank() && (
                 direct.contains("连不上") ||
                     direct.contains("配对失败") ||
                     direct.contains("连接失败") ||
                     direct.contains("删除失败") ||
                     direct.contains("创建失败") ||
+                    direct.contains("重命名失败") ||
+                    direct.contains("复制失败") ||
+                    direct.contains("移动失败") ||
                     direct.contains("通道已关闭") ||
                     direct.contains("连接已中断") ||
                     direct.contains("请重新连接") ||
                     direct.contains("传输不完整") ||
-                    direct.contains("安装失败")
+                    direct.contains("安装失败") ||
+                    direct.contains("无法打开") ||
+                    direct.contains("未连接")
                 )
         ) {
             return direct

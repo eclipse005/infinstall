@@ -542,6 +542,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             val resolver = getApplication<Application>().contentResolver
+            val cacheDir = getApplication<Application>().cacheDir
             val base = _ui.value.remotePath.trimEnd('/').ifEmpty { "/sdcard" }
             var failed = 0
             try {
@@ -555,7 +556,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     try {
                         withTimeout(200_000) {
                             resolver.openInputStream(uri)?.use { input ->
-                                session.pushToRemote(input, remote) { p ->
+                                session.pushToRemote(input, remote, cacheDir) { p ->
                                     _ui.update {
                                         it.copy(
                                             filesBanner = p.label,
