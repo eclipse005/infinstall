@@ -192,6 +192,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         connectedEndpoint = "$h:$p",
                         connectBanner = null,
                         errorMessage = null,
+                        // 连上后直接去装包
+                        tab = MainTab.Install,
                     )
                 }
                 startHeartbeat()
@@ -525,8 +527,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun uploadUris(uris: List<Uri>) {
         if (uris.isEmpty() || !session.isConnected) return
-        viewModelScope.launch {
-            _ui.update { it.copy(transferring = true, filesBanner = null, tab = MainTab.Files) }
+        transferJob?.cancel()
+        session.clearCancel()
+        transferJob = viewModelScope.launch {
+            _ui.update {
+                it.copy(
+                    transferring = true,
+                    filesBanner = null,
+                    tab = MainTab.Files,
+                    transferProgress = 0f,
+                    transferLabel = "准备上传…",
+                )
+            }
             val resolver = getApplication<Application>().contentResolver
             val base = _ui.value.remotePath.trimEnd('/').ifEmpty { "/sdcard" }
             var failed = 0
@@ -539,15 +551,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val name = queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}"
                     val remote = "$base/$name"
                     try {
-                        withTimeout(180_000) {
+                        withTimeout(200_000) {
                             resolver.openInputStream(uri)?.use { input ->
-                                session.pushToRemote(input, remote) { msg ->
-                                    _ui.update { it.copy(filesBanner = msg) }
+                                session.pushToRemote(input, remote) { p ->
+                                    _ui.update {
+                                        it.copy(
+                                            filesBanner = p.label,
+                                            transferProgress = p.fraction,
+                                            transferLabel = p.label,
+                                        )
+                                    }
                                 }
                             } ?: run { failed++ }
                         }
                     } catch (t: Throwable) {
-                        if (t is CancellationException) throw t
+                        if (t is CancellationException ||
+                            t is com.infinstall.app.adb.TransferCancelledException
+                        ) {
+                            _ui.update {
+                                it.copy(
+                                    transferring = false,
+                                    transferProgress = null,
+                                    transferLabel = null,
+                                    filesBanner = "已取消",
+                                )
+                            }
+                            return@launch
+                        }
                         failed++
                         _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
                     }
@@ -555,14 +585,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         transferring = false,
+                        transferProgress = null,
+                        transferLabel = null,
                         filesBanner = if (failed == 0) "上传完成" else "上传完成，失败 $failed",
                     )
                 }
                 refreshFiles()
             } catch (t: Throwable) {
-                if (t is CancellationException) throw t
+                if (t is CancellationException) {
+                    _ui.update {
+                        it.copy(transferring = false, transferProgress = null, filesBanner = "已取消")
+                    }
+                    throw t
+                }
                 _ui.update {
-                    it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
+                    it.copy(
+                        transferring = false,
+                        transferProgress = null,
+                        filesBanner = ErrorMessages.humanize(t),
+                    )
                 }
             }
         }
@@ -773,6 +814,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         stopHeartbeat()
+        transferJob?.cancel()
+        session.requestCancel()
         super.onCleared()
     }
 }
