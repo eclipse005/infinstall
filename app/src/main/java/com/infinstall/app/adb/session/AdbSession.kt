@@ -5,7 +5,9 @@ import android.os.SystemClock
 import android.util.Log
 import com.infinstall.app.adb.InfinstallAdbManager
 import com.infinstall.app.adb.model.AdbException
+import com.infinstall.app.adb.model.RemoteFile
 import com.infinstall.app.adb.model.SessionState
+import com.infinstall.app.adb.transport.AdbSync
 import com.infinstall.app.adb.transport.AdbTransport
 import io.github.muntashirakon.adb.AdbPairingRequiredException
 import kotlinx.coroutines.Dispatchers
@@ -21,18 +23,12 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * Sole owner of connection lifecycle.
+ * Connection lifecycle + official ADB operations.
  *
- * ## Contract (best practice)
- * 1. **Connect once → stay [SessionState.Connected]** while remote adbd keeps our session.
- * 2. Only three ways to leave Connected:
- *    - User calls [disconnect]
- *    - [connect] fails before reaching Connected
- *    - Transport proves the socket is dead ([onTransportDead]) — rare, definitive
- * 3. Operation timeout / permission / parse errors update [SessionState.Connected.lastError]
- *    but **never** disconnect.
- * 4. No heartbeat that kills the session. Remote adbd idle is fine.
- * 5. All I/O goes through [transport] under serial mutex.
+ * File I/O: [syncList]/[syncStat]/[syncPush]/[syncPull] → `sync:` service.
+ * Commands: [shell] → `shell:` for rm/mv/mkdir/pm only.
+ *
+ * Connected stays Connected until user disconnect / connect retry / definitive TCP death.
  */
 class AdbSession private constructor(context: Context) {
     private val app = context.applicationContext
@@ -50,7 +46,6 @@ class AdbSession private constructor(context: Context) {
         manager = manager,
         isSessionLive = { _state.value is SessionState.Connected },
         onTransportDead = { reason ->
-            // Only path that auto-drops Connected (definitive I/O death).
             Log.w(TAG, "transport dead → Disconnected: $reason")
             forceDisconnectLocked()
             _state.value = SessionState.Disconnected
@@ -73,7 +68,6 @@ class AdbSession private constructor(context: Context) {
                 tcpReachable(h, pairPort)
                 transport.managerPair(h, pairPort, c)
                 Log.i(TAG, "pair ok $h:$pairPort")
-                // Pair does not open a data session — back to disconnected until connect().
                 _state.value = SessionState.Disconnected
             } catch (t: Throwable) {
                 _state.value = SessionState.Disconnected
@@ -86,25 +80,24 @@ class AdbSession private constructor(context: Context) {
         lifecycleLock.withLock {
             val h = host.trim()
             if (port !in 1..65535) throw AdbException("端口无效：$port")
-            // Tear previous session cleanly before new connect.
             forceDisconnectLocked()
             _state.value = SessionState.Connecting(h, port)
             try {
                 tcpReachable(h, port)
                 transport.managerConnect(h, port)
-                // Enter Connected BEFORE probe so shell is allowed.
                 _state.value = SessionState.Connected(
                     host = h,
                     port = port,
                     sinceMs = SystemClock.elapsedRealtime(),
                 )
+                // Official-style liveness: one shell probe
                 val probe = transport.withSerial {
                     transport.shell("echo infinstall_ok", 12_000)
                 }
                 if (!probe.contains("infinstall_ok")) {
                     Log.w(TAG, "probe soft-miss: ${probe.take(60)}")
                 }
-                Log.i(TAG, "session connected $h:$port")
+                Log.i(TAG, "session connected $h:$port (sync+shell ready)")
             } catch (t: Throwable) {
                 forceDisconnectLocked()
                 _state.value = SessionState.Disconnected
@@ -113,10 +106,6 @@ class AdbSession private constructor(context: Context) {
         }
     }
 
-    /**
-     * Explicit user disconnect. The only intentional leave of Connected
-     * (besides proven transport death).
-     */
     suspend fun disconnect() = withContext(Dispatchers.IO) {
         lifecycleLock.withLock {
             forceDisconnectLocked()
@@ -129,7 +118,7 @@ class AdbSession private constructor(context: Context) {
         transport.managerDisconnect()
     }
 
-    // ═══════ operations (stay Connected on failure) ═══════
+    // ═══════ shell commands ═══════
 
     suspend fun shell(command: String, timeoutMs: Long = 15_000): String =
         withContext(Dispatchers.IO) {
@@ -142,33 +131,68 @@ class AdbSession private constructor(context: Context) {
             }
         }
 
-    suspend fun push(
-        local: File,
-        remotePath: String,
-        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
-    ) = withContext(Dispatchers.IO) {
+    // ═══════ official sync file ops ═══════
+
+    suspend fun syncList(path: String): List<RemoteFile> = withContext(Dispatchers.IO) {
         requireConnected()
         try {
-            transport.withSerial { transport.push(local, remotePath, onProgress) }
+            transport.withSerial { transport.syncList(path) }
         } catch (t: Throwable) {
             noteOpError(t)
             throw t
         }
     }
 
-    suspend fun pull(
+    suspend fun syncStat(path: String): AdbSync.Stat = withContext(Dispatchers.IO) {
+        requireConnected()
+        try {
+            transport.withSerial { transport.syncStat(path) }
+        } catch (t: Throwable) {
+            noteOpError(t)
+            throw t
+        }
+    }
+
+    suspend fun syncPush(
+        local: File,
+        remotePath: String,
+        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
+    ) = withContext(Dispatchers.IO) {
+        requireConnected()
+        try {
+            transport.withSerial { transport.syncPush(local, remotePath, onProgress) }
+        } catch (t: Throwable) {
+            noteOpError(t)
+            throw t
+        }
+    }
+
+    suspend fun syncPull(
         remotePath: String,
         local: File,
         onProgress: (got: Long) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
         requireConnected()
         try {
-            transport.withSerial { transport.pull(remotePath, local, onProgress) }
+            transport.withSerial { transport.syncPull(remotePath, local, onProgress) }
         } catch (t: Throwable) {
             noteOpError(t)
             throw t
         }
     }
+
+    /** @deprecated Prefer [syncPush] — kept for call-site clarity */
+    suspend fun push(
+        local: File,
+        remotePath: String,
+        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
+    ) = syncPush(local, remotePath, onProgress)
+
+    suspend fun pull(
+        remotePath: String,
+        local: File,
+        onProgress: (got: Long) -> Unit = {},
+    ) = syncPull(remotePath, local, onProgress)
 
     fun q(path: String): String = transport.q(path)
 
@@ -178,7 +202,6 @@ class AdbSession private constructor(context: Context) {
         throw AdbException("未连接设备")
     }
 
-    /** Record last op error without leaving Connected. */
     private fun noteOpError(t: Throwable) {
         val msg = t.message?.take(200) ?: return
         _state.update { cur ->

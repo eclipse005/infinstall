@@ -10,7 +10,10 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 /**
- * APK install. Failures do not disconnect the session.
+ * Official install path ≈ `adb install`:
+ * 1. sync SEND APK to /data/local/tmp
+ * 2. shell: pm install …
+ * 3. shell: rm temp
  */
 class ApkInstaller(private val session: AdbSession) {
 
@@ -30,7 +33,7 @@ class ApkInstaller(private val session: AdbSession) {
 
             val remote = "/data/local/tmp/infinstall_${System.currentTimeMillis()}.apk"
             onProgress(TransferProgress(0.02f, "传输中（${size / 1024} KB）"))
-            session.push(local, remote) { sent, total ->
+            session.syncPush(local, remote) { sent, total ->
                 val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
                 onProgress(TransferProgress(0.05f + f * 0.80f, "传输 ${(f * 100).toInt()}%"))
             }
