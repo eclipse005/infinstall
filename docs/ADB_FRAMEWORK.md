@@ -26,7 +26,7 @@ UI / MainViewModel
 | 上传 | `sync` SEND / `adb push` | `AdbSync.push` |
 | 下载 | `sync` RECV / `adb pull` | `AdbSync.pull` |
 | 删除/改名/建目录 | shell | `shell:rm/mv/mkdir` 单次流 |
-| 安装 | push + `pm install` | sync SEND + shell pm |
+| 安装 | `adb install` ≡ push + `pm install` + rm | **唯一路径**：sync SEND → `pm install` → rm |
 | 连接 | pair 一次 + connect | `AdbSession` |
 
 ## 会话规则
@@ -52,3 +52,17 @@ UI / MainViewModel
 - 每次操作 open `sync:` → 干活 → QUIT → close  
 - 块大小 ≤ 64KiB（DATA）  
 - SEND 路径格式 `path,mode`（mode 含 S_IFREG）  
+
+## 安装（唯一官方路径）
+
+与 [adb install](https://developer.android.com/tools/adb#move) 分解一致，**只有这一套**：
+
+```
+1. sync SEND  →  /data/local/tmp/ii<ts>.apk   （= adb push）
+2. shell:pm install -r -t -d -g <path>        （= adb shell pm install）
+3. shell:rm -f <path>                         （清理）
+```
+
+- 安装页选文件、文件页装远端 APK，都进 `ApkInstaller.installLocalFile`  
+- **不做** stdin 流式 / 多路径 fallback（避免行为分裂）  
+- 远端 APK：先 sync RECV 到手机缓存，再走同一套  

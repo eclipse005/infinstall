@@ -194,17 +194,11 @@ class AdbSession private constructor(context: Context) {
         onProgress: (got: Long) -> Unit = {},
     ) = syncPull(remotePath, local, onProgress)
 
-    /**
-     * Install local APK file (stdin stream install, fallback push+pm).
-     * @return raw package manager output
-     */
-    suspend fun installApkFile(
-        local: File,
-        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
-    ): String = withContext(Dispatchers.IO) {
+    /** `adb shell pm install …` on a device path (short /data/local/tmp name). */
+    suspend fun pmInstall(remoteApkPath: String): String = withContext(Dispatchers.IO) {
         requireConnected()
         try {
-            transport.withSerial { transport.installApkFile(local, onProgress) }
+            transport.withSerial { transport.pmInstall(remoteApkPath) }
         } catch (t: Throwable) {
             noteOpError(t)
             throw t
