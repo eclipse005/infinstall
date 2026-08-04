@@ -43,7 +43,7 @@ class ApkInstaller(private val session: AdbSession) {
         try {
             session.syncPull(remotePath, cache) { }
             if (cache.length() <= 0L) throw AdbException("无法读取远端 APK")
-            runInstallFile(cache) { _, _ -> }
+            runInstallFile(cache) { /* silent progress for remote install */ }
         } finally {
             cache.delete()
         }
