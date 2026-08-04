@@ -3,7 +3,6 @@ package com.infinstall.app.viewmodel
 import android.app.Application
 import android.net.Uri
 import android.provider.OpenableColumns
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.infinstall.app.adb.ErrorMessages
@@ -16,14 +15,11 @@ import com.infinstall.app.util.LocalNetwork
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.FileInputStream
@@ -312,27 +308,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Heartbeat removed: it was a major source of false "连接已失效".
+     * Session lifetime is owned by explicit connect/disconnect + AdbClient.linked.
+     */
     private fun startHeartbeat() {
-        // Heartbeat shell probes were still racing with file ops and killing the session.
-        // Only mark disconnected when an actual user operation reports connection loss,
-        // or when manager reports not connected after a failed op.
         stopHeartbeat()
-        heartbeatJob = viewModelScope.launch {
-            while (isActive) {
-                delay(15_000)
-                if (!_ui.value.connected) continue
-                if (_ui.value.installing || _ui.value.transferring || _ui.value.filesLoading ||
-                    _ui.value.propsLoading
-                ) {
-                    continue
-                }
-                // Soft check only — never open competing streams under load
-                if (!session.isSessionUp()) {
-                    markRemoteGone("连接已失效，请重新连接")
-                    break
-                }
-            }
-        }
+        // intentionally empty — do not poll manager.isConnected / do not auto-disconnect
     }
 
     private fun stopHeartbeat() {
@@ -340,11 +322,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         heartbeatJob = null
     }
 
-    private suspend fun markRemoteGone(reason: String) {
+    /**
+     * Only for **proven** transport death (openStream failed and linked cleared).
+     * Never call this for a single file op timeout / parse error / permission error.
+     */
+    private fun softUnlinkIfDead(reason: String) {
+        if (session.isConnected) return
         stopHeartbeat()
         transferJob?.cancel()
-        session.requestCancel()
-        runCatching { session.disconnect() }
         _ui.update {
             it.copy(
                 connected = false,
@@ -353,11 +338,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 installing = false,
                 transferring = false,
                 filesLoading = false,
-                files = emptyList(),
                 transferProgress = null,
                 transferLabel = null,
                 errorMessage = reason,
-                tab = MainTab.Connect,
+                // Stay on current tab if possible — less jarring; user can go to Connect
                 connectBanner = null,
             )
         }
@@ -402,28 +386,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             try {
                 for ((index, uri) in uris.withIndex()) {
-                    if (!session.isSessionUp()) {
-                        markRemoteGone("传输中设备断开")
-                        return@launch
+                    if (!session.isConnected) {
+                        append("当前未连接，请先连接设备")
+                        softUnlinkIfDead("未连接设备")
+                        break
                     }
                     val name = queryDisplayName(uri) ?: "app_${index + 1}.apk"
                     append("— $name —")
                     try {
-                        withTimeout(200_000) {
-                            resolver.openInputStream(uri)?.use { input ->
-                                session.installApk(input, name, cacheDir) { p ->
-                                    append(p.label)
-                                    _ui.update {
-                                        it.copy(
-                                            transferProgress = p.fraction,
-                                            transferLabel = p.label,
-                                        )
-                                    }
+                        // No outer withTimeout — AdbClient has its own; outer cancel races mutex.
+                        resolver.openInputStream(uri)?.use { input ->
+                            session.installApk(input, name, cacheDir) { p ->
+                                append(p.label)
+                                _ui.update {
+                                    it.copy(
+                                        transferProgress = p.fraction,
+                                        transferLabel = p.label,
+                                    )
                                 }
-                            } ?: run {
-                                failed++
-                                append("无法读取 $name")
                             }
+                        } ?: run {
+                            failed++
+                            append("无法读取 $name")
                         }
                     } catch (t: Throwable) {
                         if (t is CancellationException ||
@@ -443,10 +427,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         failed++
                         append(ErrorMessages.humanize(t))
-                        if (!session.isSessionUp()) {
-                            markRemoteGone("设备已断开")
-                            return@launch
-                        }
+                        softUnlinkIfDead("连接已中断，请重新连接")
                     }
                 }
                 _ui.update {
@@ -487,7 +468,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(filesLoading = true, filesBanner = null) }
             try {
                 val path = _ui.value.remotePath
-                val list = withTimeout(25_000) { session.listDir(path) }
+                // Rely on AdbClient timeout only — outer withTimeout cancels mid-mutex → chaos
+                val list = session.listDir(path)
                 _ui.update {
                     it.copy(
                         filesLoading = false,
@@ -497,16 +479,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                if (!session.isSessionUp()) {
-                    markRemoteGone("设备已断开")
-                } else {
-                    _ui.update {
-                        it.copy(
-                            filesLoading = false,
-                            filesBanner = "无法列出文件：${t.message ?: "错误"}",
-                        )
-                    }
+                _ui.update {
+                    it.copy(
+                        filesLoading = false,
+                        filesBanner = "无法列出文件：${ErrorMessages.humanize(t)}",
+                    )
                 }
+                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -569,26 +548,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             try {
                 for (uri in uris) {
-                    if (!session.isSessionUp()) {
-                        markRemoteGone("传输中设备断开")
-                        return@launch
+                    if (!session.isConnected) {
+                        softUnlinkIfDead("未连接设备")
+                        break
                     }
                     val name = queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}"
                     val remote = "$base/$name"
                     try {
-                        withTimeout(200_000) {
-                            resolver.openInputStream(uri)?.use { input ->
-                                session.pushToRemote(input, remote, cacheDir) { p ->
-                                    _ui.update {
-                                        it.copy(
-                                            filesBanner = p.label,
-                                            transferProgress = p.fraction,
-                                            transferLabel = p.label,
-                                        )
-                                    }
+                        resolver.openInputStream(uri)?.use { input ->
+                            session.pushToRemote(input, remote, cacheDir) { p ->
+                                _ui.update {
+                                    it.copy(
+                                        filesBanner = p.label,
+                                        transferProgress = p.fraction,
+                                        transferLabel = p.label,
+                                    )
                                 }
-                            } ?: run { failed++ }
-                        }
+                            }
+                        } ?: run { failed++ }
                     } catch (t: Throwable) {
                         if (t is CancellationException ||
                             t is com.infinstall.app.adb.TransferCancelledException
@@ -605,6 +582,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         failed++
                         _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+                        softUnlinkIfDead("连接已中断，请重新连接")
                     }
                 }
                 _ui.update {
@@ -640,17 +618,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val path = file.fullPath(_ui.value.remotePath)
             _ui.update { it.copy(filesBanner = "正在删除 ${file.name}…", filesLoading = true) }
             try {
-                withTimeout(30_000) { session.deleteRemote(path) }
+                session.deleteRemote(path)
                 _ui.update { it.copy(filesBanner = "已删除 ${file.name}", filesLoading = false) }
                 refreshFiles()
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                // Do NOT drop whole session on one failed delete — only if session really gone
-                val msg = ErrorMessages.humanize(t)
-                _ui.update { it.copy(filesBanner = msg, filesLoading = false) }
-                if (!session.isSessionUp()) {
-                    markRemoteGone("连接已失效，请重新连接")
+                // Single delete failure ≠ disconnect the whole session
+                _ui.update {
+                    it.copy(filesBanner = ErrorMessages.humanize(t), filesLoading = false)
                 }
+                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -665,7 +642,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val path = _ui.value.remotePath.trimEnd('/') + "/" + n
             try {
-                withTimeout(15_000) { session.mkdirRemote(path) }
+                session.mkdirRemote(path)
                 _ui.update { it.copy(filesBanner = "已创建 $n") }
                 refreshFiles()
             } catch (t: Throwable) {
@@ -686,7 +663,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val from = file.fullPath(_ui.value.remotePath)
             val to = _ui.value.remotePath.trimEnd('/') + "/" + n
             try {
-                withTimeout(20_000) { session.renameRemote(from, to) }
+                session.renameRemote(from, to)
                 _ui.update { it.copy(filesBanner = "已重命名为 $n") }
                 refreshFiles()
             } catch (t: Throwable) {
@@ -722,12 +699,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             _ui.update { it.copy(transferring = true, filesBanner = "粘贴中…") }
             try {
-                withTimeout(180_000) {
-                    if (clip.isCut) {
-                        session.moveRemote(clip.path, dest)
-                    } else {
-                        session.copyRemote(clip.path, dest)
-                    }
+                if (clip.isCut) {
+                    session.moveRemote(clip.path, dest)
+                } else {
+                    session.copyRemote(clip.path, dest)
                 }
                 _ui.update {
                     it.copy(
@@ -742,6 +717,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
                 }
+                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -761,7 +737,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             try {
                 val path = file.fullPath(_ui.value.remotePath)
-                val props = withTimeout(15_000) { session.statRemote(path) }
+                val props = session.statRemote(path)
                 _ui.update {
                     it.copy(
                         propsLoading = false,
@@ -810,12 +786,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val cache = File(getApplication<Application>().cacheDir, "dl_${System.currentTimeMillis()}_${file.name}")
             try {
                 val remote = file.fullPath(_ui.value.remotePath)
-                withTimeout(180_000) {
-                    session.pullToLocal(remote, cache) { got ->
-                        if (file.size > 0) {
-                            _ui.update {
-                                it.copy(filesBanner = "下载 ${got * 100 / file.size.coerceAtLeast(1)}%")
-                            }
+                session.pullToLocal(remote, cache) { got ->
+                    if (file.size > 0) {
+                        _ui.update {
+                            it.copy(filesBanner = "下载 ${got * 100 / file.size.coerceAtLeast(1)}%")
                         }
                     }
                 }
@@ -850,7 +824,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(transferring = true, filesBanner = "正在安装 ${file.name}…") }
             try {
                 val remote = file.fullPath(_ui.value.remotePath)
-                withTimeout(120_000) { session.installRemoteApk(remote) }
+                session.installRemoteApk(remote)
                 _ui.update {
                     it.copy(transferring = false, filesBanner = "安装成功：${file.name}")
                 }
@@ -859,6 +833,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
                 }
+                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }

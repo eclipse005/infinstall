@@ -21,8 +21,11 @@ UI / MainViewModel
 3. Shell 必须是**单行**命令；不要嵌套超时包超时。
 4. 任何 `AdbStream` 必须在 `finally` 里关闭。
 5. **已连接时禁止再开第二条 TCP 去探测 adbd**（单客户端 adbd 会误杀会话）。
-6. 连接成功后：**先写入 host/port，再 shell 探测**（顺序反了会报「未连接设备」）。
-7. 改连接 / 文件 / 安装路径时，必须对照本文件过一遍检查清单。
+6. 连接成功后：**先写入 host/port + linked，再 shell 探测**。
+7. **超时 / 单次操作失败 ≠ 断开会话**。禁止在 ViewModel 里因 list/delete 失败就 `markRemoteGone`。
+8. **禁止心跳自动 disconnect**。`linked` 是 UI 连接态真源，`manager.isConnected` 不可靠。
+9. Shell 用 `__INF_END__` 结束标记，不要干等 stream EOF。
+10. ViewModel **不要**再包一层 `withTimeout` 包住持 mutex 的 ADB 调用（会取消协程、打乱流）。
 
 ## 连接状态机
 

@@ -24,21 +24,27 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Unified ADB framework for Infinstall.
+ * Unified ADB transport.
  *
- * Rules:
- * 1. Only this class opens AdbStream / talks to libadb
- * 2. One operation at a time (mutex)
- * 3. Single-line shell commands only
- * 4. Hard timeout + always close streams
- * 5. Never open a second TCP client to adbd while connected
+ * Stability rules:
+ * - One operation at a time ([mutex])
+ * - Our own [linked] flag is the source of truth for UI (manager.isConnected can flap)
+ * - Timeouts throw errors but do **not** tear down the session
+ * - Session is only dropped on: user disconnect, connect/pair failure, or openStream
+ *   proving the transport is dead
+ * - Shell commands append an end marker so we don't hang waiting for stream EOF
  */
 class AdbClient private constructor(context: Context) {
     private val appContext = context.applicationContext
     private val manager get() = InfinstallAdbManager.get(appContext)
     private val mutex = Mutex()
-    private val pool = Executors.newCachedThreadPool()
+    private val pool = Executors.newCachedThreadPool { r ->
+        Thread(r, "adb-io").apply { isDaemon = true }
+    }
     private val cancelFlag = AtomicBoolean(false)
+
+    /** App-level session flag — NOT manager.isConnected (which is flaky after stream errors). */
+    private val linked = AtomicBoolean(false)
 
     @Volatile
     var host: String? = null
@@ -49,7 +55,7 @@ class AdbClient private constructor(context: Context) {
         private set
 
     val isConnected: Boolean
-        get() = host != null && port != null && manager.isConnected
+        get() = linked.get() && host != null
 
     fun requestCancel() = cancelFlag.set(true)
     fun clearCancel() = cancelFlag.set(false)
@@ -70,6 +76,7 @@ class AdbClient private constructor(context: Context) {
                 timed(60_000) {
                     if (!manager.pair(h, pairPort, c)) error("配对失败")
                 }
+                Log.i(TAG, "pair ok $h:$pairPort")
             } catch (t: Throwable) {
                 throw mapConnect(t, h, pairPort, pairing = true)
             }
@@ -89,18 +96,17 @@ class AdbClient private constructor(context: Context) {
                         error("连接失败（握手未完成）")
                     }
                 }
-                // host/port MUST be recorded before any shellLocked/ensureConnected.
-                // Previously host stayed null until after the probe → always threw「未连接设备」.
+                // Bookkeeping BEFORE any shell — order matters.
                 this@AdbClient.host = h
                 this@AdbClient.port = port
-                if (!manager.isConnected) {
-                    throw AdbException("连接未建立")
-                }
-                val probe = shellLocked("echo infinstall_ok", 8_000)
-                Log.i(TAG, "connected $h:$port probe=${probe.take(60)}")
+                linked.set(true)
+
+                val probe = shellLocked("echo infinstall_ok", 12_000)
                 if (!probe.contains("infinstall_ok")) {
-                    Log.w(TAG, "probe without expected marker (still connected)")
+                    Log.w(TAG, "probe unexpected: ${probe.take(80)}")
+                    // Still accept: some shells wrap output; stream worked.
                 }
+                Log.i(TAG, "connected $h:$port")
             } catch (t: Throwable) {
                 disconnectLocked()
                 throw mapConnect(t, h, port, pairing = false)
@@ -113,34 +119,38 @@ class AdbClient private constructor(context: Context) {
     }
 
     private fun disconnectLocked() {
+        linked.set(false)
+        host = null
+        port = null
         try {
             manager.disconnect()
         } catch (_: Exception) {
         }
-        host = null
-        port = null
     }
 
     // ═══════ shell ═══════
 
-    /** Public shell (serialized). */
     suspend fun shell(command: String, timeoutMs: Long = 15_000): String =
         withContext(Dispatchers.IO) {
             mutex.withLock { shellLocked(command, timeoutMs) }
         }
 
     /**
-     * Must hold [mutex]. Single-line command only.
+     * Must hold [mutex]. Single-line command. Appends end marker for reliable completion.
      */
     fun shellLocked(command: String, timeoutMs: Long): String {
-        ensureConnected()
+        ensureLinked()
         val cmd = command.replace("\r", "").replace('\n', ' ').trim()
-        Log.i(TAG, "shell(${timeoutMs}ms): ${cmd.take(200)}")
+        // Marker lets us finish without relying on stream EOF (hangs on some adbd).
+        val marker = "__INF_END__"
+        val full = "$cmd; echo $marker"
+        Log.i(TAG, "shell(${timeoutMs}ms): ${cmd.take(180)}")
         return timed(timeoutMs) {
             var stream: AdbStream? = null
             try {
-                stream = manager.openStream("shell:$cmd")
-                readAll(stream, maxBytes = 4 * 1024 * 1024)
+                stream = openStreamSafe("shell:$full")
+                val raw = readUntilMarker(stream, marker, maxBytes = 4 * 1024 * 1024)
+                raw
             } catch (t: Throwable) {
                 throw mapStream(t)
             } finally {
@@ -157,7 +167,7 @@ class AdbClient private constructor(context: Context) {
         onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
     ) = withContext(Dispatchers.IO) {
         mutex.withLock {
-            ensureConnected()
+            ensureLinked()
             checkCancel()
             val total = local.length()
             if (total <= 0L) throw AdbException("本地文件为空")
@@ -167,14 +177,13 @@ class AdbClient private constructor(context: Context) {
                 shellLocked("mkdir -p ${q(parent)}", 10_000)
             }
 
-            // sh -c 'cat > path' then close stream = EOF for cat
             val shCmd = "cat > ${q(remotePath)}"
             var stream: AdbStream? = null
             try {
                 stream = timed(15_000) {
-                    manager.openStream("exec:sh -c ${q(shCmd)}")
+                    openStreamSafe("exec:sh -c ${q(shCmd)}")
                 }
-                timed(180_000) {
+                timed(300_000) {
                     val os = stream!!.openOutputStream()
                     FileInputStream(local).use { fis ->
                         val buf = ByteArray(64 * 1024)
@@ -219,7 +228,7 @@ class AdbClient private constructor(context: Context) {
         onProgress: (got: Long) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
         mutex.withLock {
-            ensureConnected()
+            ensureLinked()
             checkCancel()
             local.parentFile?.mkdirs()
             if (local.exists()) local.delete()
@@ -227,9 +236,9 @@ class AdbClient private constructor(context: Context) {
             var stream: AdbStream? = null
             try {
                 stream = timed(15_000) {
-                    manager.openStream("shell:cat ${q(remotePath)}")
+                    openStreamSafe("shell:cat ${q(remotePath)}")
                 }
-                timed(180_000) {
+                timed(300_000) {
                     FileOutputStream(local).use { fos ->
                         val input = stream!!.openInputStream()
                         val buf = ByteArray(64 * 1024)
@@ -258,9 +267,31 @@ class AdbClient private constructor(context: Context) {
 
     fun q(path: String): String = "'" + path.replace("'", "'\\''") + "'"
 
-    private fun ensureConnected() {
-        // Prefer live manager state — host is bookkeeping for UI / last endpoint.
-        if (!manager.isConnected) throw AdbException("未连接设备")
+    private fun ensureLinked() {
+        if (!linked.get()) throw AdbException("未连接设备")
+    }
+
+    private fun openStreamSafe(dest: String): AdbStream {
+        return try {
+            manager.openStream(dest)
+        } catch (t: Throwable) {
+            if (isTransportDead(t)) {
+                Log.e(TAG, "transport dead on openStream", t)
+                linked.set(false)
+            }
+            throw t
+        }
+    }
+
+    private fun isTransportDead(t: Throwable): Boolean {
+        val m = (t.message ?: "").lowercase()
+        val name = t.javaClass.simpleName.lowercase()
+        return "closed" in m ||
+            "connection reset" in m ||
+            "broken pipe" in m ||
+            "not connected" in m ||
+            "socket" in m && ("closed" in m || "reset" in m) ||
+            name.contains("eof")
     }
 
     private fun sizeFromLs(lsLine: String): Long? {
@@ -270,22 +301,33 @@ class AdbClient private constructor(context: Context) {
             ?: return null
         if (line.contains("No such", ignoreCase = true)) return null
         val tokens = line.split(Regex("\\s+"))
-        // perms nlink owner group size ...
         if (tokens.size >= 5) return tokens[4].toLongOrNull()
         return tokens.firstNotNullOfOrNull { it.toLongOrNull() }
     }
 
-    private fun readAll(stream: AdbStream, maxBytes: Int): String {
+    /**
+     * Read shell output until [marker] line appears (or stream ends / max size).
+     */
+    private fun readUntilMarker(stream: AdbStream, marker: String, maxBytes: Int): String {
         val input = stream.openInputStream()
         val bos = ByteArrayOutputStream()
         val buf = ByteArray(8 * 1024)
+        val text = StringBuilder()
         while (bos.size() < maxBytes) {
             val n = input.read(buf)
             if (n < 0) break
             if (n == 0) continue
             bos.write(buf, 0, n)
+            text.append(String(buf, 0, n, StandardCharsets.UTF_8))
+            if (text.contains(marker)) break
         }
-        return bos.toString(StandardCharsets.UTF_8.name())
+        val full = bos.toString(StandardCharsets.UTF_8.name())
+        val idx = full.indexOf(marker)
+        return if (idx >= 0) {
+            full.substring(0, idx).trimEnd('\r', '\n', ' ')
+        } else {
+            full.trimEnd('\r', '\n', ' ')
+        }
     }
 
     private fun closeQuiet(stream: AdbStream?) {
@@ -296,11 +338,8 @@ class AdbClient private constructor(context: Context) {
     }
 
     /**
-     * Hard timeout for blocking I/O. On timeout we interrupt the worker; callers must
-     * still close AdbStreams in finally (shell/push/pull already do).
-     *
-     * Note: interrupt does not always unblock socket read — residual risk of a stuck
-     * worker until stream is closed by the calling finally / disconnect.
+     * Hard timeout. On timeout: cancel worker, throw — do **NOT** disconnect the session.
+     * Callers close streams in finally; a later op can still use the same connection.
      */
     private fun <T> timed(timeoutMs: Long, block: () -> T): T {
         val f = pool.submit(Callable { block() })
@@ -308,14 +347,7 @@ class AdbClient private constructor(context: Context) {
             f.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             f.cancel(true)
-            // Best-effort: drop the session so a half-open stream cannot poison later ops.
-            try {
-                manager.disconnect()
-            } catch (_: Exception) {
-            }
-            host = null
-            port = null
-            throw AdbException("操作超时（${timeoutMs / 1000}s），请重新连接后再试")
+            throw AdbException("操作超时（${timeoutMs / 1000}s），请重试（连接未断开）")
         } catch (e: Exception) {
             val c = e.cause ?: e
             when (c) {
@@ -330,7 +362,10 @@ class AdbClient private constructor(context: Context) {
 
     private fun tcpCheck(host: String, port: Int) {
         try {
-            Socket().use { s -> s.connect(InetSocketAddress(host, port), 3_000) }
+            Socket().use { s ->
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress(host, port), 4_000)
+            }
         } catch (t: Throwable) {
             throw AdbException("无法访问 $host:$port（同一 Wi‑Fi、关 VPN、开调试）", t)
         }
@@ -339,7 +374,10 @@ class AdbClient private constructor(context: Context) {
     private fun mapStream(t: Throwable): Throwable {
         if (t is TransferCancelledException || t is AdbException) return t
         val m = (t.message ?: "").lowercase()
-        if ("closed" in m) return AdbException("连接通道已关闭，请断开后重新连接", t)
+        if ("closed" in m) {
+            // Do not auto-unlink: one bad stream ≠ dead session on all devices.
+            return AdbException("通道异常，请重试；若连续失败再点断开重连", t)
+        }
         return AdbException(t.message ?: "通信失败", t)
     }
 
@@ -347,17 +385,11 @@ class AdbClient private constructor(context: Context) {
         if (t is AdbPairingRequiredException) {
             return AdbException("需要先配对（展开下方「配对码」选项）", t)
         }
-        if (t is AdbException) {
-            // Keep our message, but clarify common wireless-debug port mix-up on connect
-            if (!pairing && t.message == "未连接设备") {
-                return AdbException("连接失败（$host:$port）：会话未就绪，请重试", t)
-            }
-            return t
-        }
+        if (t is AdbException) return t
         val m = (t.message ?: t.javaClass.simpleName)
         val head = if (pairing) "配对失败" else "连接失败"
-        val hint = if (!pairing && port != 5555) {
-            "。若刚配对：请用无线调试主页顶部的「连接端口」，不要用配对弹窗里的端口"
+        val hint = if (!pairing) {
+            "。无线调试请用主页顶部连接端口（不是配对端口）；电视网络调试多为 5555"
         } else {
             ""
         }
