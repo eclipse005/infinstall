@@ -31,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.infinstall.app.ui.theme.MinTouch
+import com.infinstall.app.viewmodel.MainTab
 import com.infinstall.app.viewmodel.UiState
 
 @Composable
@@ -52,6 +53,11 @@ fun InstallScreen(
     ) {
         item {
             Text("安装", style = MaterialTheme.typography.headlineMedium)
+            Text(
+                "选 APK，直接装到已连接的设备",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         if (!state.connected) {
@@ -92,9 +98,19 @@ fun InstallScreen(
                     .fillMaxWidth()
                     .heightIn(min = 56.dp),
             ) {
-                Icon(Icons.Default.FolderOpen, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text(if (state.installing) "安装中…" else "选择 APK")
+                if (state.installing) {
+                    CircularProgressIndicator(
+                        Modifier.size(22.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("安装中…")
+                } else {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("选择 APK 安装")
+                }
             }
         }
 
@@ -102,22 +118,20 @@ fun InstallScreen(
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                        Text("正在安装，请稍候", style = MaterialTheme.typography.bodyMedium)
-                    }
+                    Text(
+                        "传输并安装中，大文件可能需要一两分钟",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         }
 
-        // only install-related banners — not "已连接"
         state.installBanner?.let { msg ->
             item {
                 Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    ),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
@@ -125,11 +139,13 @@ fun InstallScreen(
             }
         }
 
-        if (state.tab == com.infinstall.app.viewmodel.MainTab.Install) {
+        if (state.tab == MainTab.Install) {
             state.errorMessage?.let { msg ->
                 item {
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                        ),
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)

@@ -10,8 +10,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -32,8 +32,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.infinstall.app.ui.screens.AppsScreen
 import com.infinstall.app.ui.screens.ConnectScreen
+import com.infinstall.app.ui.screens.FilesScreen
 import com.infinstall.app.ui.screens.InstallScreen
 import com.infinstall.app.ui.theme.ContentMaxWidth
 import com.infinstall.app.ui.theme.TabletBreakpoint
@@ -49,7 +49,7 @@ private data class NavItem(
 private val navItems = listOf(
     NavItem(MainTab.Connect, "连接", Icons.Default.Tv),
     NavItem(MainTab.Install, "安装", Icons.Default.Download),
-    NavItem(MainTab.Apps, "应用", Icons.Default.Apps),
+    NavItem(MainTab.Files, "文件", Icons.Default.Folder),
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -151,11 +151,15 @@ fun InfinstallRoot(vm: MainViewModel) {
                                 onGoConnect = { vm.selectTab(MainTab.Connect) },
                                 modifier = contentModifier,
                             )
-                            MainTab.Apps -> AppsScreen(
+                            MainTab.Files -> FilesScreen(
                                 state = state,
-                                onRefresh = vm::refreshApps,
-                                onUninstall = vm::uninstall,
+                                onRefresh = vm::refreshFiles,
+                                onUpload = vm::uploadUris,
+                                onOpenDir = vm::openRemoteDir,
+                                onGoUp = vm::goUpRemote,
+                                onDelete = vm::deleteRemote,
                                 onGoConnect = { vm.selectTab(MainTab.Connect) },
+                                onGoDownloadDir = { vm.setRemotePath("/sdcard/Download") },
                                 modifier = contentModifier,
                             )
                         }

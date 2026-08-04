@@ -2,10 +2,11 @@ package com.infinstall.app.viewmodel
 
 import android.app.Application
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.infinstall.app.adb.ErrorMessages
-import com.infinstall.app.adb.TvAppInfo
+import com.infinstall.app.adb.RemoteFile
 import com.infinstall.app.adb.TvSession
 import com.infinstall.app.data.ConnectionHistoryStore
 import com.infinstall.app.data.HostEntry
@@ -23,7 +24,7 @@ import kotlinx.coroutines.withTimeout
 enum class MainTab {
     Connect,
     Install,
-    Apps,
+    Files,
 }
 
 enum class ConnectMode {
@@ -42,17 +43,18 @@ data class UiState(
     val pairing: Boolean = false,
     val connected: Boolean = false,
     val connectedEndpoint: String? = null,
-    /** Connect-tab only messages (pair hints, disconnect notice). Not shown on Install/Apps. */
     val connectBanner: String? = null,
     val errorMessage: String? = null,
     val history: List<HostEntry> = emptyList(),
     val installing: Boolean = false,
     val installLog: List<String> = emptyList(),
     val installBanner: String? = null,
-    val appsLoading: Boolean = false,
-    val apps: List<TvAppInfo> = emptyList(),
-    val appsBanner: String? = null,
-    val uninstallingPackage: String? = null,
+    // files
+    val remotePath: String = "/sdcard/Download",
+    val filesLoading: Boolean = false,
+    val files: List<RemoteFile> = emptyList(),
+    val filesBanner: String? = null,
+    val transferring: Boolean = false,
 )
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
@@ -63,8 +65,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
     private var heartbeatJob: Job? = null
-    private var appsJob: Job? = null
-    private var labelJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -75,18 +75,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectTab(tab: MainTab) {
-        _ui.update {
-            it.copy(
-                tab = tab,
-                // don't carry connection "已连接" onto other tabs
-                errorMessage = if (tab == MainTab.Connect) it.errorMessage else null,
-            )
-        }
-        if (tab == MainTab.Apps && session.isConnected) {
-            // only load if empty; avoid re-scan loop every time user opens tab
-            if (_ui.value.apps.isEmpty() && !_ui.value.appsLoading) {
-                refreshApps()
-            }
+        _ui.update { it.copy(tab = tab, errorMessage = null) }
+        if (tab == MainTab.Files && session.isConnected && _ui.value.files.isEmpty()) {
+            refreshFiles()
         }
     }
 
@@ -114,13 +105,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val h = (host ?: _ui.value.hostInput).trim()
         val p = port ?: _ui.value.portInput.toIntOrNull() ?: 5555
         if (h.isEmpty()) {
-            _ui.update { it.copy(errorMessage = "请输入设备的 IP 地址。") }
+            _ui.update { it.copy(errorMessage = "请输入 IP 地址") }
             return
         }
         viewModelScope.launch {
             stopHeartbeat()
-            appsJob?.cancel()
-            labelJob?.cancel()
             _ui.update {
                 it.copy(
                     connecting = true,
@@ -128,18 +117,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     connectBanner = "正在连接…",
                     hostInput = h,
                     portInput = p.toString(),
-                    apps = emptyList(),
+                    files = emptyList(),
                 )
             }
             try {
-                session.connect(h, p)
+                withTimeout(45_000) { session.connect(h, p) }
                 historyStore.rememberSuccess(h, p)
                 _ui.update {
                     it.copy(
                         connecting = false,
                         connected = true,
                         connectedEndpoint = "$h:$p",
-                        // 顶部栏已显示已连接，这里不再重复「已连接」
                         connectBanner = null,
                         errorMessage = null,
                     )
@@ -165,28 +153,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val pairPort = _ui.value.pairPortInput.toIntOrNull()
         val code = _ui.value.pairCodeInput.trim()
         if (h.isEmpty()) {
-            _ui.update { it.copy(errorMessage = "请输入设备 IP 地址。") }
+            _ui.update { it.copy(errorMessage = "请输入 IP") }
             return
         }
         if (pairPort == null || pairPort <= 0) {
-            _ui.update { it.copy(errorMessage = "请输入配对端口。") }
+            _ui.update { it.copy(errorMessage = "请输入配对端口") }
             return
         }
         if (code.length < 5) {
-            _ui.update { it.copy(errorMessage = "请输入 6 位配对码。") }
+            _ui.update { it.copy(errorMessage = "请输入 6 位配对码") }
             return
         }
         viewModelScope.launch {
-            _ui.update {
-                it.copy(pairing = true, errorMessage = null, connectBanner = "正在配对…")
-            }
+            _ui.update { it.copy(pairing = true, errorMessage = null, connectBanner = "配对中…") }
             try {
-                session.pair(h, pairPort, code)
+                withTimeout(60_000) { session.pair(h, pairPort, code) }
                 _ui.update {
                     it.copy(
                         pairing = false,
-                        connectBanner = "配对成功，请填写连接端口后点「连接」",
-                        errorMessage = null,
+                        connectBanner = "配对成功，请填连接端口后点连接",
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
                     )
@@ -207,17 +192,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnect() {
         viewModelScope.launch {
             stopHeartbeat()
-            appsJob?.cancel()
-            labelJob?.cancel()
             session.disconnect()
             _ui.update {
                 it.copy(
                     connected = false,
                     connectedEndpoint = null,
                     connectBanner = "已断开",
-                    apps = emptyList(),
-                    appsLoading = false,
+                    files = emptyList(),
                     installing = false,
+                    transferring = false,
                 )
             }
         }
@@ -227,16 +210,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         stopHeartbeat()
         heartbeatJob = viewModelScope.launch {
             while (isActive) {
-                delay(3_500)
+                delay(2_500)
                 if (!_ui.value.connected) continue
-                if (_ui.value.installing) continue // don't interfere with transfer
-                val alive = try {
-                    session.ping()
-                } catch (_: Throwable) {
-                    false
-                }
-                if (!alive) {
-                    markRemoteGone()
+                // Pure TCP — never blocked by install mutex / stuck shell
+                if (!session.isTcpAlive()) {
+                    markRemoteGone("设备已断开（网络调试可能已关闭）")
                     break
                 }
             }
@@ -248,46 +226,35 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         heartbeatJob = null
     }
 
-    private suspend fun markRemoteGone() {
+    private suspend fun markRemoteGone(reason: String) {
         stopHeartbeat()
-        appsJob?.cancel()
-        labelJob?.cancel()
         runCatching { session.disconnect() }
         _ui.update {
             it.copy(
                 connected = false,
                 connectedEndpoint = null,
-                connectBanner = null,
-                apps = emptyList(),
-                appsLoading = false,
+                connecting = false,
                 installing = false,
-                // surface on all tabs via error on current + connect banner
-                errorMessage = "设备已断开。可能已关闭网络调试，或网络中断。请重新连接。",
+                transferring = false,
+                filesLoading = false,
+                files = emptyList(),
+                errorMessage = reason,
                 tab = MainTab.Connect,
+                connectBanner = null,
             )
         }
     }
 
     fun removeHistory(entry: HostEntry) {
-        viewModelScope.launch {
-            historyStore.remove(entry.host, entry.port)
-        }
+        viewModelScope.launch { historyStore.remove(entry.host, entry.port) }
     }
 
     fun installFromUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
         if (!session.isConnected) {
-            _ui.update {
-                it.copy(
-                    tab = MainTab.Connect,
-                    errorMessage = "请先连接设备",
-                )
-            }
+            _ui.update { it.copy(tab = MainTab.Connect, errorMessage = "请先连接设备") }
             return
         }
-        // cancel heavy apps work so mutex is free for install
-        appsJob?.cancel()
-        labelJob?.cancel()
         viewModelScope.launch {
             _ui.update {
                 it.copy(
@@ -296,7 +263,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     installLog = emptyList(),
                     installBanner = null,
                     errorMessage = null,
-                    appsLoading = false,
                 )
             }
             val resolver = getApplication<Application>().contentResolver
@@ -304,32 +270,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val logs = mutableListOf<String>()
             fun append(line: String) {
                 logs.add(line)
-                _ui.update { state -> state.copy(installLog = logs.toList()) }
+                _ui.update { s -> s.copy(installLog = logs.toList()) }
             }
             var failed = 0
             try {
-                uris.forEachIndexed { index, uri ->
-                    if (!session.isConnected) {
-                        markRemoteGone()
+                for ((index, uri) in uris.withIndex()) {
+                    if (!session.isTcpAlive()) {
+                        markRemoteGone("传输中设备断开")
                         return@launch
                     }
-                    val name = uri.lastPathSegment?.substringAfterLast('/')
-                        ?: "应用 ${index + 1}.apk"
+                    val name = queryDisplayName(uri) ?: "app_${index + 1}.apk"
                     try {
-                        resolver.openInputStream(uri)?.use { input ->
-                            session.installApk(input, name, cacheDir) { status ->
-                                append(status)
+                        withTimeout(180_000) {
+                            resolver.openInputStream(uri)?.use { input ->
+                                session.installApk(input, name, cacheDir) { append(it) }
+                            } ?: run {
+                                failed++
+                                append("无法读取 $name")
                             }
-                        } ?: run {
-                            failed++
-                            append("无法读取：$name")
                         }
                     } catch (t: Throwable) {
                         if (t is CancellationException) throw t
                         failed++
                         append(ErrorMessages.humanize(t))
-                        if (!session.isConnected || t.message?.contains("断开") == true) {
-                            markRemoteGone()
+                        if (!session.isTcpAlive()) {
+                            markRemoteGone("设备已断开")
                             return@launch
                         }
                     }
@@ -337,11 +302,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         installing = false,
-                        installBanner = if (failed == 0) {
-                            "安装完成（${uris.size}）"
-                        } else {
-                            "完成 ${uris.size - failed}，失败 $failed"
-                        },
+                        installBanner = if (failed == 0) "安装完成" else "完成，失败 $failed 个",
                     )
                 }
             } catch (t: Throwable) {
@@ -357,109 +318,126 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun refreshApps() {
-        if (!session.isConnected) return
-        appsJob?.cancel()
-        appsJob = viewModelScope.launch {
-            _ui.update {
-                it.copy(appsLoading = true, appsBanner = null, errorMessage = null)
-            }
-            try {
-                val apps = withTimeout(25_000) {
-                    session.listThirdPartyApps()
-                }
-                _ui.update {
-                    it.copy(
-                        appsLoading = false,
-                        apps = apps,
-                        appsBanner = if (apps.isEmpty()) "暂无第三方应用" else null,
-                    )
-                }
-                // background: improve a few labels without blocking UI
-                enrichLabels(apps)
-            } catch (t: Throwable) {
-                if (t is CancellationException) {
-                    _ui.update { it.copy(appsLoading = false) }
-                    throw t
-                }
-                val dead = !session.isConnected ||
-                    t.message?.contains("Not connected", ignoreCase = true) == true ||
-                    t.message?.contains("未连接", ignoreCase = true) == true
-                if (dead) {
-                    markRemoteGone()
-                } else {
-                    _ui.update {
-                        it.copy(
-                            appsLoading = false,
-                            appsBanner = "应用列表加载失败，可点刷新重试",
-                            errorMessage = null,
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    private fun enrichLabels(apps: List<TvAppInfo>) {
-        labelJob?.cancel()
-        labelJob = viewModelScope.launch {
-            // only first 30 to keep light
-            val updated = apps.toMutableList()
-            var changed = false
-            for (i in updated.indices) {
-                if (!isActive || !session.isConnected) break
-                if (_ui.value.installing) break
-                val app = updated[i]
-                val better = session.resolveLabel(app.packageName) ?: continue
-                if (better.isNotBlank() && better != app.label) {
-                    updated[i] = app.copy(label = better)
-                    changed = true
-                    if (changed && i % 3 == 0) {
-                        _ui.update { it.copy(apps = updated.sortedBy { a -> a.label.lowercase() }) }
-                    }
-                }
-                delay(50)
-            }
-            if (changed) {
-                _ui.update { it.copy(apps = updated.sortedBy { a -> a.label.lowercase() }) }
-            }
-        }
-    }
-
-    fun uninstall(packageName: String) {
+    fun refreshFiles() {
         if (!session.isConnected) return
         viewModelScope.launch {
-            _ui.update { it.copy(uninstallingPackage = packageName, errorMessage = null) }
+            _ui.update { it.copy(filesLoading = true, filesBanner = null) }
             try {
-                session.uninstall(packageName)
-                val apps = session.listThirdPartyApps()
+                val path = _ui.value.remotePath
+                val list = withTimeout(25_000) { session.listDir(path) }
                 _ui.update {
-                    it.copy(
-                        uninstallingPackage = null,
-                        apps = apps,
-                        appsBanner = "已卸载",
-                    )
+                    it.copy(filesLoading = false, files = list, filesBanner = null)
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                if (!session.isConnected) {
-                    markRemoteGone()
+                if (!session.isTcpAlive()) {
+                    markRemoteGone("设备已断开")
                 } else {
                     _ui.update {
                         it.copy(
-                            uninstallingPackage = null,
-                            appsBanner = ErrorMessages.humanize(t, session.host, session.port),
+                            filesLoading = false,
+                            filesBanner = "无法列出文件：${t.message ?: "错误"}",
                         )
                     }
                 }
             }
         }
+    }
+
+    fun openRemoteDir(name: String) {
+        val cur = _ui.value.remotePath.trimEnd('/')
+        val next = "$cur/$name"
+        _ui.update { it.copy(remotePath = next, files = emptyList()) }
+        refreshFiles()
+    }
+
+    fun goUpRemote() {
+        val cur = _ui.value.remotePath.trimEnd('/')
+        if (cur.isEmpty() || cur == "/" || cur == "/sdcard") return
+        val parent = cur.substringBeforeLast('/', "/sdcard").ifEmpty { "/sdcard" }
+        _ui.update { it.copy(remotePath = parent, files = emptyList()) }
+        refreshFiles()
+    }
+
+    fun setRemotePath(path: String) {
+        _ui.update { it.copy(remotePath = path.trim().ifEmpty { "/sdcard/Download" }, files = emptyList()) }
+        refreshFiles()
+    }
+
+    fun uploadUris(uris: List<Uri>) {
+        if (uris.isEmpty() || !session.isConnected) return
+        viewModelScope.launch {
+            _ui.update { it.copy(transferring = true, filesBanner = null, tab = MainTab.Files) }
+            val resolver = getApplication<Application>().contentResolver
+            val base = _ui.value.remotePath.trimEnd('/')
+            var failed = 0
+            try {
+                for (uri in uris) {
+                    if (!session.isTcpAlive()) {
+                        markRemoteGone("传输中设备断开")
+                        return@launch
+                    }
+                    val name = queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}"
+                    val remote = "$base/$name"
+                    try {
+                        withTimeout(180_000) {
+                            resolver.openInputStream(uri)?.use { input ->
+                                session.pushToRemote(input, remote) { msg ->
+                                    _ui.update { it.copy(filesBanner = msg) }
+                                }
+                            } ?: run { failed++ }
+                        }
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        failed++
+                        _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+                    }
+                }
+                _ui.update {
+                    it.copy(
+                        transferring = false,
+                        filesBanner = if (failed == 0) "传输完成" else "完成，失败 $failed",
+                    )
+                }
+                refreshFiles()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update {
+                    it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
+                }
+            }
+        }
+    }
+
+    fun deleteRemote(file: RemoteFile) {
+        if (!session.isConnected) return
+        viewModelScope.launch {
+            val path = _ui.value.remotePath.trimEnd('/') + "/" + file.name
+            try {
+                withTimeout(20_000) { session.deleteRemote(path) }
+                _ui.update { it.copy(filesBanner = "已删除 ${file.name}") }
+                refreshFiles()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                if (!session.isTcpAlive()) markRemoteGone("设备已断开")
+                else _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+            }
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        val cr = getApplication<Application>().contentResolver
+        cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (i >= 0) return c.getString(i)
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')
     }
 
     override fun onCleared() {
         stopHeartbeat()
-        appsJob?.cancel()
-        labelJob?.cancel()
         super.onCleared()
     }
 }
