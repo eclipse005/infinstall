@@ -1,6 +1,7 @@
 package com.infinstall.app.adb
 
 import android.content.Context
+import android.util.Base64
 import android.util.Log
 import io.github.muntashirakon.adb.AdbPairingRequiredException
 import kotlinx.coroutines.Dispatchers
@@ -35,22 +36,18 @@ class TvSession(private val appContext: Context) {
     val isConnected: Boolean
         get() = manager.isConnected
 
-    /**
-     * Android 11+ wireless debugging pairing.
-     * Pairing dialog must stay open on the target until this finishes.
-     */
     suspend fun pair(host: String, pairingPort: Int, pairingCode: String) =
         withContext(Dispatchers.IO) {
             mutex.withLock {
                 val h = host.trim()
                 val code = pairingCode.filter { it.isDigit() }
-                require(code.length in 5..8) { "配对码应为设备上显示的 6 位数字" }
+                require(code.length in 5..8) { "配对码应为 6 位数字" }
 
                 ensureTcpReachable(h, pairingPort, "配对端口")
 
                 try {
                     val ok = manager.pair(h, pairingPort, code)
-                    if (!ok) error("配对返回失败（未知原因）")
+                    if (!ok) error("配对失败")
                     Log.i(TAG, "pair ok $h:$pairingPort")
                 } catch (t: Throwable) {
                     Log.e(TAG, "pair failed $h:$pairingPort", t)
@@ -73,11 +70,9 @@ class TvSession(private val appContext: Context) {
             try {
                 val ok = manager.connect(h, port)
                 if (!ok && !manager.isConnected) {
-                    error("连接超时或被拒绝。若是无线调试，请确认已配对，且端口是「无线调试」主界面上的连接端口（不是配对端口）。")
+                    error("连接失败。无线调试请先配对，并使用「连接端口」。")
                 }
-                // light probe
-                val out = runCatching { shellLocked("echo infinstall_ok") }.getOrDefault("")
-                Log.i(TAG, "connect probe: ${out.take(80)}")
+                runCatching { shellLocked("echo infinstall_ok") }
                 this@TvSession.host = h
                 this@TvSession.port = port
             } catch (t: Throwable) {
@@ -112,12 +107,12 @@ class TvSession(private val appContext: Context) {
     ) = withContext(Dispatchers.IO) {
         mutex.withLock {
             check(manager.isConnected) { "未连接设备" }
-            onStatus("正在准备 $displayName …")
+            onStatus("准备 $displayName")
             val local = File(cacheDir, "install_${System.currentTimeMillis()}.apk")
             try {
                 FileOutputStream(local).use { out -> input.copyTo(out) }
                 val size = local.length()
-                onStatus("正在传输并安装 $displayName（${size / 1024} KB）…")
+                onStatus("安装中 $displayName（${size / 1024} KB）")
                 val stream = manager.openStream("exec:cmd package install -r -t -S $size")
                 stream.openOutputStream().use { os ->
                     local.inputStream().use { it.copyTo(os) }
@@ -129,10 +124,10 @@ class TvSession(private val appContext: Context) {
                 if (text.contains("Failure", ignoreCase = true) ||
                     text.contains("Error", ignoreCase = true)
                 ) {
-                    onStatus("改用备用安装方式…")
+                    onStatus("改用备用方式…")
                     installViaPushPmLocked(local)
                 }
-                onStatus("已安装 $displayName")
+                onStatus("完成 $displayName")
             } finally {
                 local.delete()
             }
@@ -162,27 +157,141 @@ class TvSession(private val appContext: Context) {
     suspend fun listThirdPartyApps(): List<TvAppInfo> = withContext(Dispatchers.IO) {
         mutex.withLock {
             check(manager.isConnected) { "未连接设备" }
-            val raw = shellLocked("pm list packages -3")
-            val packages = raw.lineSequence()
-                .map { it.trim() }
-                .filter { it.startsWith("package:") }
-                .map { it.removePrefix("package:").trim() }
-                .filter { it.isNotEmpty() }
-                .toList()
+            val packages = listPackageNamesLocked()
+            if (packages.isEmpty()) return@withLock emptyList()
+
+            // One remote script: dump labels for all packages (prefer zh-CN)
+            val labels = resolveLabelsBatchLocked(packages)
             packages.map { pkg ->
-                TvAppInfo(packageName = pkg, label = resolveLabelLocked(pkg))
+                val label = labels[pkg]?.takeIf { it.isNotBlank() && it != pkg }
+                    ?: friendlyFallbackName(pkg)
+                TvAppInfo(packageName = pkg, label = label)
             }.sortedBy { it.label.lowercase() }
         }
     }
 
-    private fun resolveLabelLocked(packageName: String): String {
-        return try {
-            val dump = shellLocked("dumpsys package $packageName | grep -m1 applicationLabel")
-            val match = Regex("applicationLabel=(\\S+)").find(dump)
-            match?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() } ?: packageName
-        } catch (_: Exception) {
-            packageName
+    private fun listPackageNamesLocked(): List<String> {
+        val raw = shellLocked("pm list packages -3")
+        return raw.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("package:") }
+            .map { it.removePrefix("package:").trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+    }
+
+    /**
+     * Batch-resolve human labels via dumpsys (supports application-label-zh-CN etc.).
+     */
+    private fun resolveLabelsBatchLocked(packages: List<String>): Map<String, String> {
+        val result = linkedMapOf<String, String>()
+        // Script printed as: PKG\tLABEL
+        val script = buildString {
+            appendLine("#!/system/bin/sh")
+            // packages embedded safely
+            append("PKGS=\"")
+            packages.forEachIndexed { i, p ->
+                if (i > 0) append(' ')
+                // package names are safe [a-z0-9_.]
+                append(p.filter { it.isLetterOrDigit() || it == '.' || it == '_' })
+            }
+            appendLine("\"")
+            appendLine(
+                """
+                for p in ${'$'}PKGS; do
+                  [ -z "${'$'}p" ] && continue
+                  d=${'$'}(dumpsys package "${'$'}p" 2>/dev/null)
+                  lab=""
+                  for key in application-label-zh-CN application-label-zh application-label application-label-en; do
+                    # formats: application-label-zh-CN:'名字'  or application-label:'Name'
+                    line=${'$'}(printf '%s\n' "${'$'}d" | grep -F "${'$'}key:" 2>/dev/null | head -n 1)
+                    if [ -n "${'$'}line" ]; then
+                      lab=${'$'}(printf '%s\n' "${'$'}line" | sed -n "s/.*${'$'}key:'\\([^']*\\)'.*/\\1/p")
+                      if [ -z "${'$'}lab" ]; then
+                        lab=${'$'}(printf '%s\n' "${'$'}line" | sed -n "s/.*${'$'}key:[[:space:]]*//p" | head -c 80)
+                      fi
+                    fi
+                    [ -n "${'$'}lab" ] && break
+                  done
+                  if [ -z "${'$'}lab" ]; then
+                    lab=${'$'}(printf '%s\n' "${'$'}d" | grep -oE 'nonLocalizedLabel=[^[:space:]]+' 2>/dev/null | head -n 1 | cut -d= -f2-)
+                  fi
+                  if [ -z "${'$'}lab" ]; then
+                    lab=${'$'}(printf '%s\n' "${'$'}d" | grep -oE 'applicationLabel=[^[:space:]]+' 2>/dev/null | head -n 1 | cut -d= -f2-)
+                  fi
+                  # strip CR
+                  lab=${'$'}(printf '%s' "${'$'}lab" | tr -d '\r')
+                  printf '@@%s@@%s\n' "${'$'}p" "${'$'}lab"
+                done
+                """.trimIndent(),
+            )
         }
+
+        return try {
+            val b64 = Base64.encodeToString(
+                script.toByteArray(StandardCharsets.UTF_8),
+                Base64.NO_WRAP,
+            )
+            // base64 -d works on Android toybox; fallback base64 -D on some
+            val out = shellLocked(
+                "echo $b64 | (base64 -d 2>/dev/null || base64 -D 2>/dev/null || busybox base64 -d) | sh",
+            )
+            out.lineSequence().forEach { line ->
+                val m = Regex("^@@([^@]+)@@(.*)$").find(line.trim()) ?: return@forEach
+                val pkg = m.groupValues[1].trim()
+                val lab = m.groupValues[2].trim()
+                if (pkg.isNotEmpty() && lab.isNotEmpty()) {
+                    result[pkg] = lab
+                }
+            }
+            // Fallback per-package if batch produced nothing (broken base64/sh)
+            if (result.isEmpty() && packages.isNotEmpty()) {
+                packages.take(40).forEach { pkg ->
+                    resolveLabelSingleLocked(pkg)?.let { result[pkg] = it }
+                }
+            }
+            result
+        } catch (t: Throwable) {
+            Log.w(TAG, "batch label failed", t)
+            packages.take(40).forEach { pkg ->
+                resolveLabelSingleLocked(pkg)?.let { result[pkg] = it }
+            }
+            result
+        }
+    }
+
+    private fun resolveLabelSingleLocked(packageName: String): String? {
+        return try {
+            val dump = shellLocked("dumpsys package $packageName")
+            pickBestLabel(dump)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun pickBestLabel(dump: String): String? {
+        val keys = listOf(
+            "application-label-zh-CN",
+            "application-label-zh",
+            "application-label",
+            "application-label-en",
+        )
+        for (key in keys) {
+            Regex("$key:'([^']*)'").find(dump)?.groupValues?.getOrNull(1)
+                ?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+            Regex("$key:(\\S+)").find(dump)?.groupValues?.getOrNull(1)
+                ?.trim()?.takeIf { it.isNotEmpty() && !it.startsWith("0x") }?.let { return it }
+        }
+        Regex("nonLocalizedLabel=(\\S+)").find(dump)?.groupValues?.getOrNull(1)
+            ?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        Regex("applicationLabel=(\\S+)").find(dump)?.groupValues?.getOrNull(1)
+            ?.trim()?.takeIf { it.isNotEmpty() && !it.startsWith("0x") }?.let { return it }
+        return null
+    }
+
+    private fun friendlyFallbackName(packageName: String): String {
+        val last = packageName.substringAfterLast('.').ifBlank { packageName }
+        return last.replaceFirstChar { ch -> if (ch.isLowerCase()) ch.titlecase() else ch.toString() }
     }
 
     suspend fun uninstall(packageName: String) = withContext(Dispatchers.IO) {
@@ -228,10 +337,7 @@ class TvSession(private val appContext: Context) {
             }
         } catch (t: Throwable) {
             throw IllegalStateException(
-                "手机连不上平板的$label $host:$port。" +
-                    "请核对：① 同一 Wi‑Fi（不要一个用流量/访客网络）；② IP 是否抄对；" +
-                    "③ $label 是否就是当前弹窗/页面上显示的端口；" +
-                    "④ 路由器是否开了 AP 隔离。原始错误：${t.javaClass.simpleName}: ${t.message}",
+                "无法访问$label $host:$port。请检查同一 Wi‑Fi、IP/端口，并关闭 VPN。",
                 t,
             )
         }
@@ -239,15 +345,12 @@ class TvSession(private val appContext: Context) {
 
     private fun wrap(t: Throwable, host: String, port: Int, pairing: Boolean): Throwable {
         if (t is AdbPairingRequiredException) {
-            return IllegalStateException(
-                "设备要求先配对。请打开平板「无线调试 → 使用配对码配对设备」，在配对弹窗仍显示时完成配对，再用连接端口连接。",
-                t,
-            )
+            return IllegalStateException("需要先配对，请用「配对设备」。", t)
         }
         val detail = buildString {
             var c: Throwable? = t
             var i = 0
-            while (c != null && i < 4) {
+            while (c != null && i < 3) {
                 if (i > 0) append(" | ")
                 append(c.javaClass.simpleName)
                 if (!c.message.isNullOrBlank()) append(": ").append(c.message)
@@ -256,11 +359,11 @@ class TvSession(private val appContext: Context) {
             }
         }
         val head = if (pairing) {
-            "配对失败（$host:$port）。请保持平板配对弹窗不要关闭，配对码 6 位、配对端口与弹窗一致。"
+            "配对失败（$host:$port）"
         } else {
-            "连接失败（$host:$port）。无线调试请先配对；连接时用主界面 IP:端口，不要用配对端口。"
+            "连接失败（$host:$port）"
         }
-        return IllegalStateException("$head\n详情：$detail", t)
+        return IllegalStateException("$head\n$detail", t)
     }
 
     companion object {

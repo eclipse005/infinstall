@@ -1,6 +1,8 @@
 package com.infinstall.app.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
@@ -32,10 +35,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.infinstall.app.adb.TvAppInfo
 import com.infinstall.app.ui.theme.MinTouch
 import com.infinstall.app.viewmodel.UiState
+import kotlin.math.absoluteValue
 
 @Composable
 fun AppsScreen(
@@ -50,9 +59,9 @@ fun AppsScreen(
     pendingUninstall?.let { app ->
         AlertDialog(
             onDismissRequest = { pendingUninstall = null },
-            title = { Text("确认卸载") },
+            title = { Text("卸载应用") },
             text = {
-                Text("确定从电视卸载「${app.label}」\n（${app.packageName}）？")
+                Text("确定卸载「${app.label}」？")
             },
             confirmButton = {
                 TextButton(
@@ -73,12 +82,31 @@ fun AppsScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item {
-            Text("应用管理", style = MaterialTheme.typography.headlineMedium)
-            Text(
-                "查看电视上已安装的第三方应用，并可卸载。",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "应用",
+                    style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                if (state.connected) {
+                    OutlinedButton(
+                        onClick = onRefresh,
+                        enabled = !state.appsLoading,
+                        modifier = Modifier.heightIn(min = MinTouch),
+                    ) {
+                        if (state.appsLoading) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Refresh, contentDescription = "刷新")
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Text("刷新")
+                    }
+                }
+            }
         }
 
         if (!state.connected) {
@@ -89,27 +117,16 @@ fun AppsScreen(
                     ),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("尚未连接电视", style = MaterialTheme.typography.titleMedium)
+                    Column(
+                        Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text("还没连接设备", style = MaterialTheme.typography.titleMedium)
                         Button(
                             onClick = onGoConnect,
                             modifier = Modifier.heightIn(min = MinTouch),
                         ) { Text("去连接") }
                     }
-                }
-            }
-        } else {
-            item {
-                OutlinedButton(
-                    onClick = onRefresh,
-                    enabled = !state.appsLoading,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = MinTouch),
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (state.appsLoading) "刷新中…" else "刷新列表")
                 }
             }
         }
@@ -120,7 +137,7 @@ fun AppsScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyLarge)
+                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }
@@ -130,7 +147,7 @@ fun AppsScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyLarge)
+                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }
@@ -140,9 +157,10 @@ fun AppsScreen(
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.padding(vertical = 24.dp),
                 ) {
                     CircularProgressIndicator()
-                    Text("正在读取电视应用列表…", style = MaterialTheme.typography.bodyLarge)
+                    Text("加载应用列表…", style = MaterialTheme.typography.bodyLarge)
                 }
             }
         }
@@ -150,7 +168,7 @@ fun AppsScreen(
         if (state.connected && !state.appsLoading && state.apps.isEmpty()) {
             item {
                 Text(
-                    "没有第三方应用，或列表为空。",
+                    "暂无第三方应用",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -162,19 +180,33 @@ fun AppsScreen(
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = MinTouch),
+                    .heightIn(min = 64.dp),
             ) {
                 Row(
-                    Modifier.padding(12.dp),
+                    Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    AppAvatar(label = app.label, packageName = app.packageName)
+                    Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(app.label, style = MaterialTheme.typography.titleMedium)
                         Text(
-                            app.packageName,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            app.label,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
+                        // 包名缩小为次要信息，有中文名时不抢戏
+                        if (app.label != app.packageName &&
+                            !app.label.equals(app.packageName.substringAfterLast('.'), ignoreCase = true)
+                        ) {
+                            Text(
+                                app.packageName,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
                     OutlinedButton(
                         onClick = { pendingUninstall = app },
@@ -193,4 +225,43 @@ fun AppsScreen(
 
         item { Spacer(Modifier.height(24.dp)) }
     }
+}
+
+@Composable
+private fun AppAvatar(label: String, packageName: String) {
+    val letter = remember(label) {
+        label.trim().firstOrNull()?.uppercaseChar()?.toString()
+            ?: packageName.firstOrNull()?.uppercaseChar()?.toString()
+            ?: "?"
+    }
+    val bg = remember(packageName) { colorForPackage(packageName) }
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .clip(CircleShape)
+            .background(bg),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = letter,
+            color = Color.White,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+private fun colorForPackage(packageName: String): Color {
+    val palette = listOf(
+        Color(0xFF1565C0),
+        Color(0xFF2E7D32),
+        Color(0xFF6A1B9A),
+        Color(0xFFC62828),
+        Color(0xFF00838F),
+        Color(0xFFEF6C00),
+        Color(0xFF4527A0),
+        Color(0xFF37474F),
+    )
+    val idx = packageName.hashCode().absoluteValue % palette.size
+    return palette[idx]
 }

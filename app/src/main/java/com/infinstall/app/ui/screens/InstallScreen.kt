@@ -25,7 +25,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -41,16 +40,11 @@ fun InstallScreen(
     onGoConnect: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val multiPicker = rememberLauncherForActivityResult(
+    // 一个入口：系统文件选择器，支持多选
+    val picker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
     ) { uris ->
         if (uris.isNotEmpty()) onInstallUris(uris)
-    }
-
-    val singlePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri != null) onInstallUris(listOf(uri))
     }
 
     LazyColumn(
@@ -58,12 +52,7 @@ fun InstallScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Text("安装应用", style = MaterialTheme.typography.headlineMedium)
-            Text(
-                "从本机选择 APK，无线装到已连接的电视。也可在其它 App 里用「分享」到无限安装。",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Text("安装", style = MaterialTheme.typography.headlineMedium)
         }
 
         if (!state.connected) {
@@ -74,9 +63,11 @@ fun InstallScreen(
                     ),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("尚未连接电视", style = MaterialTheme.typography.titleMedium)
-                        Text("请先在「连接」页输入 IP 连接（或先配对再连接）。", style = MaterialTheme.typography.bodyLarge)
+                    Column(
+                        Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text("还没连接设备", style = MaterialTheme.typography.titleMedium)
                         Button(
                             onClick = onGoConnect,
                             modifier = Modifier.heightIn(min = MinTouch),
@@ -89,43 +80,37 @@ fun InstallScreen(
         item {
             Button(
                 onClick = {
-                    // Prefer multi-select; MIME for APK
-                    multiPicker.launch(arrayOf(
-                        "application/vnd.android.package-archive",
-                        "application/octet-stream",
-                        "*/*",
-                    ))
+                    picker.launch(
+                        arrayOf(
+                            "application/vnd.android.package-archive",
+                            "application/octet-stream",
+                            "*/*",
+                        ),
+                    )
                 },
                 enabled = state.connected && !state.installing,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = MinTouch),
+                    .heightIn(min = 56.dp),
             ) {
                 Icon(Icons.Default.FolderOpen, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text("选择 APK（可多选）")
-            }
-            OutlinedButton(
-                onClick = {
-                    singlePicker.launch(arrayOf(
-                        "application/vnd.android.package-archive",
-                        "application/octet-stream",
-                        "*/*",
-                    ))
-                },
-                enabled = state.connected && !state.installing,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = MinTouch),
-            ) {
-                Text("选择单个文件")
+                Text(if (state.installing) "安装中…" else "选择 APK")
             }
         }
 
         if (state.installing) {
             item {
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-                RowLoading("正在安装，请勿离开…")
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                        Text("正在安装，请稍候", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
             }
         }
 
@@ -135,7 +120,7 @@ fun InstallScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyLarge)
+                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }
@@ -145,31 +130,17 @@ fun InstallScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyLarge)
+                    Text(msg, Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }
 
         if (state.installLog.isNotEmpty()) {
-            item {
-                Text("安装过程", style = MaterialTheme.typography.titleMedium)
-            }
             items(state.installLog) { line ->
-                Text("· $line", style = MaterialTheme.typography.bodyLarge)
+                Text(line, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
         item { Spacer(Modifier.height(24.dp)) }
-    }
-}
-
-@Composable
-private fun RowLoading(text: String) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        CircularProgressIndicator(Modifier.size(28.dp))
-        Text(text, style = MaterialTheme.typography.bodyLarge)
     }
 }

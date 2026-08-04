@@ -116,7 +116,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         connecting = false,
                         connected = true,
                         connectedEndpoint = "$h:$p",
-                        statusMessage = "已连接 $h:$p。若设备弹出授权提示，请点「允许」。",
+                        statusMessage = "已连接 $h:$p",
                         errorMessage = null,
                     )
                 }
@@ -163,7 +163,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         pairing = false,
-                        statusMessage = "配对成功。请回到「直接连接」，填入无线调试页上的「IP 地址与端口」（连接端口，不是配对端口），再点连接。",
+                        statusMessage = "配对成功。请切换到「直接连接」，用连接端口再连一次。",
                         errorMessage = null,
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
@@ -251,9 +251,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(
                     installing = false,
                     statusMessage = if (failed == 0) {
-                        "全部安装完成（${uris.size} 个）"
+                        "安装完成（${uris.size}）"
                     } else {
-                        "完成：成功 ${uris.size - failed}，失败 $failed"
+                        "完成 ${uris.size - failed}，失败 $failed"
                     },
                 )
             }

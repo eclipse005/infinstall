@@ -67,7 +67,7 @@ fun InfinstallRoot(vm: MainViewModel) {
                         Column {
                             Text("无限安装")
                             Text(
-                                text = state.connectedEndpoint?.let { "已连接 $it" } ?: "未连接电视",
+                                text = state.connectedEndpoint?.let { "已连接 · $it" } ?: "未连接",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.9f),
                             )
