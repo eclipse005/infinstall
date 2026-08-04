@@ -80,16 +80,27 @@ class AdbClient private constructor(context: Context) {
         mutex.withLock {
             disconnectLocked()
             val h = host.trim()
+            if (port !in 1..65535) throw AdbException("端口无效：$port")
             tcpCheck(h, port)
             try {
                 timed(30_000) {
                     val ok = manager.connect(h, port)
-                    if (!ok && !manager.isConnected) error("连接失败")
+                    if (!ok && !manager.isConnected) {
+                        error("连接失败（握手未完成）")
+                    }
                 }
-                val probe = shellLocked("echo infinstall_ok", 8_000)
-                Log.i(TAG, "probe=${probe.take(40)}")
+                // host/port MUST be recorded before any shellLocked/ensureConnected.
+                // Previously host stayed null until after the probe → always threw「未连接设备」.
                 this@AdbClient.host = h
                 this@AdbClient.port = port
+                if (!manager.isConnected) {
+                    throw AdbException("连接未建立")
+                }
+                val probe = shellLocked("echo infinstall_ok", 8_000)
+                Log.i(TAG, "connected $h:$port probe=${probe.take(60)}")
+                if (!probe.contains("infinstall_ok")) {
+                    Log.w(TAG, "probe without expected marker (still connected)")
+                }
             } catch (t: Throwable) {
                 disconnectLocked()
                 throw mapConnect(t, h, port, pairing = false)
@@ -248,7 +259,8 @@ class AdbClient private constructor(context: Context) {
     fun q(path: String): String = "'" + path.replace("'", "'\\''") + "'"
 
     private fun ensureConnected() {
-        if (host == null || !manager.isConnected) throw AdbException("未连接设备")
+        // Prefer live manager state — host is bookkeeping for UI / last endpoint.
+        if (!manager.isConnected) throw AdbException("未连接设备")
     }
 
     private fun sizeFromLs(lsLine: String): Long? {
@@ -319,11 +331,23 @@ class AdbClient private constructor(context: Context) {
 
     private fun mapConnect(t: Throwable, host: String, port: Int, pairing: Boolean): Throwable {
         if (t is AdbPairingRequiredException) {
-            return AdbException("需要先配对（展开配对码选项）", t)
+            return AdbException("需要先配对（展开下方「配对码」选项）", t)
         }
-        if (t is AdbException) return t
+        if (t is AdbException) {
+            // Keep our message, but clarify common wireless-debug port mix-up on connect
+            if (!pairing && t.message == "未连接设备") {
+                return AdbException("连接失败（$host:$port）：会话未就绪，请重试", t)
+            }
+            return t
+        }
+        val m = (t.message ?: t.javaClass.simpleName)
         val head = if (pairing) "配对失败" else "连接失败"
-        return AdbException("$head（$host:$port）：${t.message ?: t.javaClass.simpleName}", t)
+        val hint = if (!pairing && port != 5555) {
+            "。若刚配对：请用无线调试主页顶部的「连接端口」，不要用配对弹窗里的端口"
+        } else {
+            ""
+        }
+        return AdbException("$head（$host:$port）：$m$hint", t)
     }
 
     companion object {

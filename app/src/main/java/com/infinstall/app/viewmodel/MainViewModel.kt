@@ -166,9 +166,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(host: String? = null, port: Int? = null) {
         val h = (host ?: _ui.value.hostInput).trim()
-        val p = port ?: _ui.value.portInput.toIntOrNull() ?: 5555
+        val rawPort = (port?.toString() ?: _ui.value.portInput).filter { it.isDigit() }
+        val p = rawPort.toIntOrNull()?.takeIf { it in 1..65535 } ?: 5555
         if (h.isEmpty()) {
             _ui.update { it.copy(errorMessage = "请输入 IP 地址") }
+            return
+        }
+        // Guard: pairing port must not be reused as connect port
+        val pairPort = _ui.value.pairPortInput.toIntOrNull()
+        if (pairPort != null && pairPort == p) {
+            _ui.update {
+                it.copy(
+                    errorMessage = "端口 $p 是配对端口，不能用来连接。" +
+                        "请填无线调试主页顶部的「连接端口」（和配对弹窗里的不同）。",
+                    portInput = p.toString(),
+                )
+            }
             return
         }
         viewModelScope.launch {
@@ -177,7 +190,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(
                     connecting = true,
                     errorMessage = null,
-                    connectBanner = "正在连接…",
+                    connectBanner = "正在连接 $h:$p …",
                     hostInput = h,
                     portInput = p.toString(),
                     files = emptyList(),
@@ -216,12 +229,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun pairDevice() {
         val h = _ui.value.hostInput.trim()
         val pairPort = _ui.value.pairPortInput.toIntOrNull()
-        val code = _ui.value.pairCodeInput.trim()
+        val code = _ui.value.pairCodeInput.filter { it.isDigit() }
         if (h.isEmpty()) {
             _ui.update { it.copy(errorMessage = "请输入 IP") }
             return
         }
-        if (pairPort == null || pairPort <= 0) {
+        if (pairPort == null || pairPort !in 1..65535) {
             _ui.update { it.copy(errorMessage = "请输入配对端口") }
             return
         }
@@ -233,12 +246,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(pairing = true, errorMessage = null, connectBanner = "配对中…") }
             try {
                 withTimeout(60_000) { session.pair(h, pairPort, code) }
+                // After pair: connect port ≠ pair port. If user still has pair port (or blank)
+                // in the connect field, clear it so they re-enter the real connect port.
+                val curPort = _ui.value.portInput.toIntOrNull()
+                val needNewPort = curPort == null || curPort == pairPort
                 _ui.update {
                     it.copy(
                         pairing = false,
-                        connectBanner = "配对成功，请填连接端口后点连接",
+                        connectBanner = "配对成功！请填上方「连接端口」" +
+                            "（无线调试主页顶部，不是配对端口 $pairPort）后点连接",
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
+                        portInput = if (needNewPort) "" else it.portInput,
+                        errorMessage = null,
+                        tab = MainTab.Connect,
                     )
                 }
             } catch (t: Throwable) {

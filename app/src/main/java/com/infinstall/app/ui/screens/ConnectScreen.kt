@@ -141,10 +141,18 @@ fun ConnectScreen(
                         value = state.portInput,
                         onValueChange = onPortChange,
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("端口") },
+                        label = { Text("连接端口") },
                         placeholder = { Text("5555") },
                         singleLine = true,
-                        supportingText = { Text("电视网络调试一般为 5555") },
+                        supportingText = {
+                            Text(
+                                if (state.portInput.isBlank()) {
+                                    "留空则用 5555；无线调试请填主页顶部端口（非配对端口）"
+                                } else {
+                                    "电视常为 5555；无线调试用主页顶部端口，不是配对弹窗端口"
+                                },
+                            )
+                        },
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Number,
                             imeAction = ImeAction.Done,
@@ -297,7 +305,8 @@ fun ConnectScreen(
                             }
                         }
                         Text(
-                            "配对成功后，回到上方填「连接端口」再点连接。",
+                            "配对成功后：回到上方填「连接端口」（无线调试主页顶部显示的端口，" +
+                                "和这里的配对端口不是同一个），再点连接。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
