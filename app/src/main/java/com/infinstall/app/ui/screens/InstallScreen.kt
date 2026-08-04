@@ -25,6 +25,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -39,6 +40,7 @@ fun InstallScreen(
     state: UiState,
     onInstallUris: (List<Uri>) -> Unit,
     onGoConnect: () -> Unit,
+    onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val picker = rememberLauncherForActivityResult(
@@ -54,7 +56,7 @@ fun InstallScreen(
         item {
             Text("安装", style = MaterialTheme.typography.headlineMedium)
             Text(
-                "选 APK，直接装到已连接的设备",
+                "选 APK 装到电视/盒子",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -73,6 +75,10 @@ fun InstallScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Text("还没连接设备", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "同一 Wi‑Fi 下连接后再安装",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         Button(
                             onClick = onGoConnect,
                             modifier = Modifier.heightIn(min = MinTouch),
@@ -117,11 +123,29 @@ fun InstallScreen(
         if (state.installing) {
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Text(
-                        "传输并安装中，大文件可能需要一两分钟",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+                    val p = state.transferProgress
+                    if (p != null && p >= 0f) {
+                        LinearProgressIndicator(
+                            progress = { p.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "${(p * 100).toInt()}%  ${state.transferLabel.orEmpty()}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    } else {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text(
+                            state.transferLabel ?: "处理中…",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onCancel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = MinTouch),
+                    ) { Text("取消") }
                 }
             }
         }
@@ -155,10 +179,13 @@ fun InstallScreen(
         }
 
         if (state.installLog.isNotEmpty()) {
+            item {
+                Text("详情", style = MaterialTheme.typography.titleSmall)
+            }
             items(state.installLog) { line ->
                 Text(
                     line,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }

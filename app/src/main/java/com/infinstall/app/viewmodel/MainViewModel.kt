@@ -39,7 +39,8 @@ enum class ConnectMode {
 }
 
 data class UiState(
-    val tab: MainTab = MainTab.Connect,
+    /** Default to Install — primary product action */
+    val tab: MainTab = MainTab.Install,
     val connectMode: ConnectMode = ConnectMode.Direct,
     val hostInput: String = "",
     /** This phone's LAN IP, e.g. 192.168.1.105 — for hint under IP field */
@@ -57,6 +58,9 @@ data class UiState(
     val installing: Boolean = false,
     val installLog: List<String> = emptyList(),
     val installBanner: String? = null,
+    /** 0f..1f during install/upload/download; null when idle */
+    val transferProgress: Float? = null,
+    val transferLabel: String? = null,
     // files
     val remotePath: String = "/sdcard/Download",
     val filesLoading: Boolean = false,
@@ -93,6 +97,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
     private var heartbeatJob: Job? = null
+    private var transferJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -248,6 +253,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() {
         viewModelScope.launch {
+            cancelTransfer()
             stopHeartbeat()
             session.disconnect()
             _ui.update {
@@ -258,21 +264,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     files = emptyList(),
                     installing = false,
                     transferring = false,
+                    transferProgress = null,
+                    transferLabel = null,
                 )
             }
+        }
+    }
+
+    fun cancelTransfer() {
+        session.requestCancel()
+        transferJob?.cancel()
+        transferJob = null
+        _ui.update {
+            it.copy(
+                installing = false,
+                transferring = false,
+                transferProgress = null,
+                transferLabel = null,
+                installBanner = if (it.installing) "已取消安装" else it.installBanner,
+                filesBanner = if (it.transferring) "已取消传输" else it.filesBanner,
+            )
         }
     }
 
     private fun startHeartbeat() {
         stopHeartbeat()
         heartbeatJob = viewModelScope.launch {
+            var failCount = 0
             while (isActive) {
-                delay(2_500)
+                delay(2_000)
                 if (!_ui.value.connected) continue
-                // Pure TCP — never blocked by install mutex / stuck shell
+                // Always TCP probe (works even while install holds ADB mutex)
                 if (!session.isTcpAlive()) {
-                    markRemoteGone("设备已断开（网络调试可能已关闭）")
-                    break
+                    failCount++
+                    // require 2 consecutive fails to reduce false positives during heavy transfer
+                    if (failCount >= 2) {
+                        markRemoteGone("设备已断开（网络调试可能已关闭）")
+                        break
+                    }
+                } else {
+                    failCount = 0
                 }
             }
         }
@@ -285,6 +316,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun markRemoteGone(reason: String) {
         stopHeartbeat()
+        transferJob?.cancel()
+        session.requestCancel()
         runCatching { session.disconnect() }
         _ui.update {
             it.copy(
@@ -295,6 +328,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 transferring = false,
                 filesLoading = false,
                 files = emptyList(),
+                transferProgress = null,
+                transferLabel = null,
                 errorMessage = reason,
                 tab = MainTab.Connect,
                 connectBanner = null,
@@ -309,10 +344,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun installFromUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
         if (!session.isConnected) {
-            _ui.update { it.copy(tab = MainTab.Connect, errorMessage = "请先连接设备") }
+            _ui.update {
+                it.copy(
+                    tab = MainTab.Connect,
+                    errorMessage = "请先连接电视/设备，再安装",
+                )
+            }
             return
         }
-        viewModelScope.launch {
+        transferJob?.cancel()
+        session.clearCancel()
+        transferJob = viewModelScope.launch {
             _ui.update {
                 it.copy(
                     tab = MainTab.Install,
@@ -320,6 +362,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     installLog = emptyList(),
                     installBanner = null,
                     errorMessage = null,
+                    transferProgress = 0f,
+                    transferLabel = "准备中…",
                 )
             }
             val resolver = getApplication<Application>().contentResolver
@@ -337,17 +381,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         return@launch
                     }
                     val name = queryDisplayName(uri) ?: "app_${index + 1}.apk"
+                    append("— $name —")
                     try {
-                        withTimeout(180_000) {
+                        withTimeout(200_000) {
                             resolver.openInputStream(uri)?.use { input ->
-                                session.installApk(input, name, cacheDir) { append(it) }
+                                session.installApk(input, name, cacheDir) { p ->
+                                    append(p.label)
+                                    _ui.update {
+                                        it.copy(
+                                            transferProgress = p.fraction,
+                                            transferLabel = p.label,
+                                        )
+                                    }
+                                }
                             } ?: run {
                                 failed++
                                 append("无法读取 $name")
                             }
                         }
                     } catch (t: Throwable) {
-                        if (t is CancellationException) throw t
+                        if (t is CancellationException ||
+                            t.message?.contains("取消") == true ||
+                            t is com.infinstall.app.adb.TransferCancelledException
+                        ) {
+                            append("已取消")
+                            _ui.update {
+                                it.copy(
+                                    installing = false,
+                                    transferProgress = null,
+                                    transferLabel = null,
+                                    installBanner = "已取消",
+                                )
+                            }
+                            return@launch
+                        }
                         failed++
                         append(ErrorMessages.humanize(t))
                         if (!session.isTcpAlive()) {
@@ -359,14 +426,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         installing = false,
-                        installBanner = if (failed == 0) "安装完成" else "完成，失败 $failed 个",
+                        transferProgress = null,
+                        transferLabel = null,
+                        installBanner = if (failed == 0) "全部安装完成" else "完成，失败 $failed 个",
                     )
                 }
             } catch (t: Throwable) {
-                if (t is CancellationException) throw t
+                if (t is CancellationException) {
+                    _ui.update {
+                        it.copy(
+                            installing = false,
+                            transferProgress = null,
+                            installBanner = "已取消",
+                        )
+                    }
+                    throw t
+                }
                 _ui.update {
                     it.copy(
                         installing = false,
+                        transferProgress = null,
+                        transferLabel = null,
                         installBanner = null,
                         errorMessage = ErrorMessages.humanize(t),
                     )

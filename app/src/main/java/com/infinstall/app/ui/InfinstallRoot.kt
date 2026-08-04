@@ -150,6 +150,7 @@ fun InfinstallRoot(vm: MainViewModel) {
                                 state = state,
                                 onInstallUris = vm::installFromUris,
                                 onGoConnect = { vm.selectTab(MainTab.Connect) },
+                                onCancel = vm::cancelTransfer,
                                 modifier = contentModifier,
                             )
                             MainTab.Files -> FilesScreen(
@@ -172,6 +173,7 @@ fun InfinstallRoot(vm: MainViewModel) {
                                 onDownload = vm::downloadRemote,
                                 onInstallApk = vm::installRemoteApk,
                                 onSort = vm::setFileSort,
+                                onCancelTransfer = vm::cancelTransfer,
                                 modifier = contentModifier,
                             )
                         }

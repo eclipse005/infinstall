@@ -56,10 +56,19 @@ data class RemoteFileProps(
 /**
  * Remote session. Every network/ADB call is hard-timeout'd so UI never spins forever.
  */
+class TransferCancelledException : Exception("已取消")
+
+data class TransferProgress(
+    /** 0f..1f, or -1 if indeterminate */
+    val fraction: Float,
+    val label: String,
+)
+
 class TvSession(private val appContext: Context) {
     private val mutex = Mutex()
     private val manager get() = InfinstallAdbManager.get(appContext)
     private val ioPool = Executors.newCachedThreadPool()
+    private val cancelFlag = AtomicBoolean(false)
 
     @Volatile
     var host: String? = null
@@ -71,6 +80,18 @@ class TvSession(private val appContext: Context) {
 
     val isConnected: Boolean
         get() = manager.isConnected && host != null
+
+    fun requestCancel() {
+        cancelFlag.set(true)
+    }
+
+    fun clearCancel() {
+        cancelFlag.set(false)
+    }
+
+    private fun checkCancel() {
+        if (cancelFlag.get()) throw TransferCancelledException()
+    }
 
     suspend fun pair(host: String, pairingPort: Int, pairingCode: String) =
         withContext(Dispatchers.IO) {
@@ -142,41 +163,64 @@ class TvSession(private val appContext: Context) {
     }
 
     /**
-     * Install APK: push to /data/local/tmp then pm install.
-     * Never blocks forever — every step has a deadline.
+     * Install APK: push to /data/local/tmp then pm install, then verify.
+     * Supports cancel via [requestCancel]. Reports [TransferProgress].
      */
     suspend fun installApk(
         input: InputStream,
         displayName: String,
         cacheDir: File,
-        onStatus: (String) -> Unit = {},
+        onProgress: (TransferProgress) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
+        clearCancel()
         mutex.withLock {
             checkLinked()
-            onStatus("准备中…")
+            checkCancel()
+            onProgress(TransferProgress(0f, "准备 $displayName"))
             val local = File(cacheDir, "apk_${System.currentTimeMillis()}.apk")
             try {
                 FileOutputStream(local).use { out -> input.copyTo(out) }
                 val size = local.length()
                 if (size <= 0L) error("APK 文件为空")
-                onStatus("传输中（${size / 1024} KB）…")
+                checkCancel()
                 val remote = "/data/local/tmp/infinstall_${System.currentTimeMillis()}.apk"
+                onProgress(TransferProgress(0.02f, "开始传输（${size / 1024} KB）"))
                 pushFile(local, remote, onProgress = { sent ->
-                    if (size > 0 && sent % (512 * 1024) < 64 * 1024) {
-                        onStatus("传输中 ${sent * 100 / size}%")
-                    }
+                    checkCancel()
+                    val frac = (sent.toFloat() / size.coerceAtLeast(1)).coerceIn(0f, 1f)
+                    // push is ~0..85% of overall install
+                    onProgress(TransferProgress(0.05f + frac * 0.80f, "传输 ${ (frac * 100).toInt() }%"))
                 })
-                onStatus("正在安装…")
-                val result = shell("pm install -r -t \"$remote\"", 90_000)
-                shell("rm -f \"$remote\"", 10_000)
-                Log.i(TAG, "pm install result: ${result.take(200)}")
+                checkCancel()
+                onProgress(TransferProgress(0.88f, "校验远端文件…"))
+                val remoteSize = remoteFileSize(remote)
+                if (remoteSize != null && remoteSize != size) {
+                    error("传输不完整：本地 ${size}B，远端 ${remoteSize}B")
+                }
+                checkCancel()
+                onProgress(TransferProgress(0.90f, "正在安装…"))
+                val result = shell("pm install -r -t -g \"$remote\" 2>&1; echo __EC:\$?", 90_000)
+                Log.i(TAG, "pm install: ${result.take(300)}")
+                // cleanup best-effort
+                runCatching { shell("rm -f \"$remote\"", 8_000) }
+                val ok = result.contains("Success", ignoreCase = true) ||
+                    result.contains("__EC:0")
+                val fail = result.contains("Failure", ignoreCase = true) ||
+                    result.contains("Error", ignoreCase = true)
                 when {
-                    result.contains("Success", ignoreCase = true) -> onStatus("安装成功")
-                    result.isBlank() -> {
-                        // some devices print little; treat empty after no exception as uncertain
-                        error("安装无响应，请到设备上确认是否已安装")
+                    ok && !fail -> {
+                        onProgress(TransferProgress(1f, "安装成功"))
                     }
-                    else -> error(result.ifBlank { "安装失败" })
+                    result.isBlank() -> error("安装无输出，可能失败。请到设备上确认。")
+                    else -> {
+                        val detail = result
+                            .lineSequence()
+                            .filter { !it.contains("__EC:") }
+                            .joinToString("\n")
+                            .trim()
+                            .ifBlank { result.trim() }
+                        error("安装失败\n$detail")
+                    }
                 }
             } finally {
                 local.delete()
@@ -188,25 +232,39 @@ class TvSession(private val appContext: Context) {
         input: InputStream,
         remotePath: String,
         sizeHint: Long = -1,
-        onStatus: (String) -> Unit = {},
+        onProgress: (TransferProgress) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
+        clearCancel()
         mutex.withLock {
             checkLinked()
+            checkCancel()
             val cache = File(appContext.cacheDir, "push_${System.currentTimeMillis()}.bin")
             try {
                 FileOutputStream(cache).use { out -> input.copyTo(out) }
-                onStatus("传输 ${cache.length() / 1024} KB…")
+                val size = cache.length().coerceAtLeast(1)
+                onProgress(TransferProgress(0f, "开始传输 ${size / 1024} KB"))
                 pushFile(cache, remotePath) { sent ->
-                    val total = cache.length().coerceAtLeast(1)
-                    if (sent % (256 * 1024) < 32 * 1024) {
-                        onStatus("传输 ${sent * 100 / total}%")
-                    }
+                    checkCancel()
+                    val frac = (sent.toFloat() / size).coerceIn(0f, 1f)
+                    onProgress(TransferProgress(frac, "传输 ${(frac * 100).toInt()}%"))
                 }
-                onStatus("已保存到 $remotePath")
+                val remoteSize = remoteFileSize(remotePath)
+                if (remoteSize != null && remoteSize > 0 && remoteSize != cache.length()) {
+                    error("传输不完整：本地 ${cache.length()}B，远端 ${remoteSize}B")
+                }
+                onProgress(TransferProgress(1f, "已保存 $remotePath"))
             } finally {
                 cache.delete()
             }
         }
+    }
+
+    private fun remoteFileSize(path: String): Long? {
+        val out = shell("wc -c < \"$path\" 2>/dev/null || stat -c %s \"$path\" 2>/dev/null", 10_000)
+        return out.lineSequence()
+            .map { it.trim().replace(Regex("\\s+"), "") }
+            .mapNotNull { it.toLongOrNull() }
+            .firstOrNull()
     }
 
     suspend fun listDir(path: String): List<RemoteFile> = withContext(Dispatchers.IO) {
@@ -436,24 +494,25 @@ class TvSession(private val appContext: Context) {
         remotePath: String,
         onProgress: (Long) -> Unit = {},
     ) {
-        // ensure parent dir
+        checkCancel()
         val parent = remotePath.substringBeforeLast('/', "")
-        if (parent.isNotEmpty()) {
+        if (parent.isNotEmpty() && parent != remotePath) {
             shell("mkdir -p \"$parent\"", 10_000)
         }
         val size = local.length()
+        // Prefer dd with known count when size is reasonable; cat works broadly
         val stream = callTimed(15_000) {
-            // exec: avoids shell profile; sh -c for redirect
             manager.openStream("exec:sh -c 'cat > \"$remotePath\"'")
         }
         val closed = AtomicBoolean(false)
         try {
-            callTimed(120_000) {
+            callTimed(180_000) {
                 val os = stream.openOutputStream()
                 FileInputStream(local).use { fis ->
                     val buf = ByteArray(64 * 1024)
                     var sent = 0L
                     while (true) {
+                        checkCancel()
                         val n = fis.read(buf)
                         if (n <= 0) break
                         os.write(buf, 0, n)
@@ -462,8 +521,12 @@ class TvSession(private val appContext: Context) {
                     }
                     os.flush()
                 }
-                // AdbOutputStream.close only flushes — must close AdbStream for EOF to cat
             }
+        } catch (t: Throwable) {
+            if (t is TransferCancelledException) {
+                runCatching { shell("rm -f \"$remotePath\"", 5_000) }
+            }
+            throw t
         } finally {
             try {
                 callTimed(10_000) {
@@ -475,21 +538,15 @@ class TvSession(private val appContext: Context) {
                 Log.w(TAG, "close push stream: ${t.message}")
             }
         }
-        // verify size if possible
-        val remoteSize = shell("wc -c < \"$remotePath\" 2>/dev/null", 10_000)
-            .trim()
-            .lines()
-            .lastOrNull()
-            ?.trim()
-            ?.toLongOrNull()
+        checkCancel()
+        val remoteSize = remoteFileSize(remotePath)
         if (remoteSize != null && remoteSize > 0 && size > 0 && remoteSize != size) {
             error("传输不完整：本地 ${size}B，远端 ${remoteSize}B")
         }
         if (remoteSize == null || remoteSize == 0L) {
-            // still try install if file might exist without wc
             val exists = shell("ls -l \"$remotePath\" 2>&1", 8_000)
-            if (exists.contains("No such") || exists.contains("cannot")) {
-                error("文件未传到设备：$exists")
+            if (exists.contains("No such") || exists.contains("cannot access")) {
+                error("文件未传到设备。$exists")
             }
         }
     }

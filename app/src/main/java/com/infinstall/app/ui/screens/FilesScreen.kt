@@ -46,6 +46,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -94,6 +95,7 @@ fun FilesScreen(
     onDownload: (RemoteFile, Uri) -> Unit,
     onInstallApk: (RemoteFile) -> Unit,
     onSort: (FileSort) -> Unit,
+    onCancelTransfer: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val picker = rememberLauncherForActivityResult(
@@ -426,6 +428,29 @@ fun FilesScreen(
                                 else -> "粘贴"
                             },
                         )
+                    }
+                }
+            }
+            if (state.transferring) {
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        val p = state.transferProgress
+                        if (p != null && p >= 0f) {
+                            LinearProgressIndicator(
+                                progress = { p.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Text(
+                                "${(p * 100).toInt()}%  ${state.transferLabel.orEmpty()}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        } else {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                        }
+                        OutlinedButton(
+                            onClick = onCancelTransfer,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("取消传输") }
                     }
                 }
             }
