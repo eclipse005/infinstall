@@ -78,13 +78,10 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    // ADB protocol over TCP — implementation detail, not product branding
-    implementation("dev.mobile:dadb:1.2.9") {
-        exclude(group = "org.junit.jupiter")
-        exclude(group = "org.junit.platform")
-        exclude(group = "org.junit.vintage")
-        exclude(group = "junit")
-    }
+    // Network debugging / wireless pair+connect (impl detail, not product branding)
+    implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

@@ -1,14 +1,15 @@
 package com.infinstall.app.adb
 
 import android.content.Context
-import dadb.Dadb
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.nio.charset.StandardCharsets
 
 data class TvAppInfo(
     val packageName: String,
@@ -16,57 +17,72 @@ data class TvAppInfo(
 )
 
 /**
- * Thread-safe session around a dadb connection.
- * Product code talks about "电视连接", not ADB.
+ * Session for install/manage on a remote device.
+ * Product wording: 连接电视 — not "ADB".
  */
 class TvSession(private val appContext: Context) {
     private val mutex = Mutex()
-    private var dadb: Dadb? = null
+    private val manager get() = InfinstallAdbManager.get(appContext)
+
     var host: String? = null
         private set
     var port: Int? = null
         private set
 
-    val isConnected: Boolean get() = dadb != null
+    val isConnected: Boolean
+        get() = manager.isConnected
+
+    /**
+     * Android 11+ wireless debugging: pair with code (one-time per device/trust).
+     * Pairing port is NOT the same as the later connection port.
+     */
+    suspend fun pair(host: String, pairingPort: Int, pairingCode: String) =
+        withContext(Dispatchers.IO) {
+            mutex.withLock {
+                val code = pairingCode.trim()
+                require(code.length in 5..8 && code.all { it.isDigit() }) {
+                    "配对码应为设备上显示的 6 位数字"
+                }
+                manager.pair(host.trim(), pairingPort, code)
+            }
+        }
 
     suspend fun connect(host: String, port: Int) = withContext(Dispatchers.IO) {
         mutex.withLock {
-            closeLocked()
-            val keyPair = AdbKeys.loadOrCreate(appContext)
-            val client = Dadb.create(host.trim(), port, keyPair)
-            try {
-                // Probe: simple shell; fails fast if unauthorized / not adb
-                val probe = client.shell("echo infinstall_ok")
-                val combined = probe.allOutput
-                if (combined.contains("unauthorized", ignoreCase = true)) {
-                    client.close()
-                    error("unauthorized")
-                }
-                dadb = client
-                this@TvSession.host = host.trim()
-                this@TvSession.port = port
-            } catch (t: Throwable) {
+            if (manager.isConnected) {
                 try {
-                    client.close()
+                    manager.disconnect()
                 } catch (_: Exception) {
                 }
-                throw t
             }
+            val h = host.trim()
+            val ok = manager.connect(h, port)
+            if (!ok && !manager.isConnected) {
+                error("连接失败")
+            }
+            // probe
+            val out = shellLocked("echo infinstall_ok")
+            if (out.contains("unauthorized", ignoreCase = true)) {
+                try {
+                    manager.disconnect()
+                } catch (_: Exception) {
+                }
+                error("unauthorized")
+            }
+            this@TvSession.host = h
+            this@TvSession.port = port
         }
     }
 
     suspend fun disconnect() = withContext(Dispatchers.IO) {
-        mutex.withLock { closeLocked() }
-    }
-
-    private fun closeLocked() {
-        try {
-            dadb?.close()
-        } catch (_: Exception) {
+        mutex.withLock {
+            try {
+                manager.disconnect()
+            } catch (_: Exception) {
+            }
+            host = null
+            port = null
         }
-        dadb = null
-        host = null
-        port = null
     }
 
     suspend fun installApk(
@@ -76,15 +92,37 @@ class TvSession(private val appContext: Context) {
         onStatus: (String) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
         mutex.withLock {
-            val client = dadb ?: error("未连接电视")
+            check(manager.isConnected) { "未连接电视" }
             onStatus("正在准备 $displayName …")
             val local = File(cacheDir, "install_${System.currentTimeMillis()}.apk")
             try {
-                FileOutputStream(local).use { out ->
-                    input.copyTo(out)
+                FileOutputStream(local).use { out -> input.copyTo(out) }
+                val size = local.length()
+                onStatus("正在传输并安装 $displayName（${size / 1024} KB）…")
+                // Streaming install via package manager (works on modern Android / most boxes)
+                val stream = manager.openStream("exec:cmd package install -r -t -S $size")
+                stream.openOutputStream().use { os ->
+                    local.inputStream().use { it.copyTo(os) }
+                    os.flush()
                 }
-                onStatus("正在传输并安装 $displayName …")
-                client.install(local)
+                val result = stream.openInputStream().use { readAll(it) }
+                stream.close()
+                val text = result.trim()
+                if (text.contains("Failure", ignoreCase = true) ||
+                    text.contains("Error", ignoreCase = true)
+                ) {
+                    // Fallback: push + pm install
+                    onStatus("改用备用安装方式…")
+                    installViaPushPmLocked(local)
+                } else if (text.isNotEmpty() &&
+                    !text.contains("Success", ignoreCase = true) &&
+                    !text.contains("success", ignoreCase = true)
+                ) {
+                    // Some devices print little; try verify by exit via second path if clearly failed
+                    if (text.contains("Exception") || text.contains("denied")) {
+                        error(text)
+                    }
+                }
                 onStatus("已安装 $displayName")
             } finally {
                 local.delete()
@@ -92,32 +130,55 @@ class TvSession(private val appContext: Context) {
         }
     }
 
+    private fun installViaPushPmLocked(local: File) {
+        val remote = "/data/local/tmp/infinstall_${System.currentTimeMillis()}.apk"
+        val size = local.length()
+        // exec:cat redirect may not work; use shell dd via base stream write
+        val push = manager.openStream("exec:sh -c 'cat > $remote'")
+        push.openOutputStream().use { os ->
+            local.inputStream().use { it.copyTo(os) }
+            os.flush()
+        }
+        // close write side by closing stream
+        try {
+            push.close()
+        } catch (_: Exception) {
+        }
+        val installOut = shellLocked("pm install -r -t \"$remote\"")
+        shellLocked("rm -f \"$remote\"")
+        if (installOut.contains("Failure", ignoreCase = true) ||
+            installOut.contains("Error", ignoreCase = true)
+        ) {
+            error(installOut.ifBlank { "安装失败" })
+        }
+        if (!installOut.contains("Success", ignoreCase = true) &&
+            installOut.isNotBlank() &&
+            installOut.contains("failed", ignoreCase = true)
+        ) {
+            error(installOut)
+        }
+    }
+
     suspend fun listThirdPartyApps(): List<TvAppInfo> = withContext(Dispatchers.IO) {
         mutex.withLock {
-            val client = dadb ?: error("未连接电视")
-            val result = client.shell("pm list packages -3")
-            val packages = result.allOutput
-                .lineSequence()
+            check(manager.isConnected) { "未连接电视" }
+            val raw = shellLocked("pm list packages -3")
+            val packages = raw.lineSequence()
                 .map { it.trim() }
                 .filter { it.startsWith("package:") }
                 .map { it.removePrefix("package:").trim() }
                 .filter { it.isNotEmpty() }
                 .toList()
-
             packages.map { pkg ->
-                val label = resolveLabel(client, pkg)
-                TvAppInfo(packageName = pkg, label = label)
+                TvAppInfo(packageName = pkg, label = resolveLabelLocked(pkg))
             }.sortedBy { it.label.lowercase() }
         }
     }
 
-    private fun resolveLabel(client: Dadb, packageName: String): String {
+    private fun resolveLabelLocked(packageName: String): String {
         return try {
-            // dumpsys is verbose; try pm path / simple fallback to package name
-            val dump = client.shell(
-                "dumpsys package $packageName | grep -m1 applicationLabel",
-            ).allOutput
-            val match = Regex("applicationLabel=([^\\s]+)").find(dump)
+            val dump = shellLocked("dumpsys package $packageName | grep -m1 applicationLabel")
+            val match = Regex("applicationLabel=(\\S+)").find(dump)
             match?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() } ?: packageName
         } catch (_: Exception) {
             packageName
@@ -126,8 +187,36 @@ class TvSession(private val appContext: Context) {
 
     suspend fun uninstall(packageName: String) = withContext(Dispatchers.IO) {
         mutex.withLock {
-            val client = dadb ?: error("未连接电视")
-            client.uninstall(packageName)
+            check(manager.isConnected) { "未连接电视" }
+            val out = shellLocked("pm uninstall ${packageName.trim()}")
+            if (out.contains("Failure", ignoreCase = true) ||
+                out.contains("DELETE_FAILED", ignoreCase = true)
+            ) {
+                error(out.ifBlank { "卸载失败" })
+            }
         }
+    }
+
+    private fun shellLocked(command: String): String {
+        val stream = manager.openStream("shell:$command")
+        return try {
+            stream.openInputStream().use { readAll(it) }
+        } finally {
+            try {
+                stream.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun readAll(input: InputStream): String {
+        val buf = ByteArrayOutputStream()
+        val tmp = ByteArray(8 * 1024)
+        while (true) {
+            val n = input.read(tmp)
+            if (n <= 0) break
+            buf.write(tmp, 0, n)
+        }
+        return buf.toString(StandardCharsets.UTF_8.name())
     }
 }

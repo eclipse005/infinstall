@@ -4,15 +4,11 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.infinstall.app.adb.AdbKeys
-import com.infinstall.app.adb.DiscoveredDevice
 import com.infinstall.app.adb.ErrorMessages
-import com.infinstall.app.adb.LanScanner
 import com.infinstall.app.adb.TvAppInfo
 import com.infinstall.app.adb.TvSession
 import com.infinstall.app.data.ConnectionHistoryStore
 import com.infinstall.app.data.HostEntry
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,18 +21,26 @@ enum class MainTab {
     Apps,
 }
 
+enum class ConnectMode {
+    /** Classic: IP + port (e.g. 5555 or wireless-debug connect port) */
+    Direct,
+    /** Android 11+ wireless debugging pairing code flow */
+    Pair,
+}
+
 data class UiState(
     val tab: MainTab = MainTab.Connect,
+    val connectMode: ConnectMode = ConnectMode.Direct,
     val hostInput: String = "",
     val portInput: String = "5555",
+    val pairPortInput: String = "",
+    val pairCodeInput: String = "",
     val connecting: Boolean = false,
+    val pairing: Boolean = false,
     val connected: Boolean = false,
     val connectedEndpoint: String? = null,
     val statusMessage: String? = null,
     val errorMessage: String? = null,
-    val scanning: Boolean = false,
-    val scanProgress: Pair<Int, Int>? = null,
-    val discovered: List<DiscoveredDevice> = emptyList(),
     val history: List<HostEntry> = emptyList(),
     val installing: Boolean = false,
     val installLog: List<String> = emptyList(),
@@ -51,8 +55,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
-
-    private var scanJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -69,6 +71,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setConnectMode(mode: ConnectMode) {
+        _ui.update { it.copy(connectMode = mode, errorMessage = null, statusMessage = null) }
+    }
+
     fun updateHost(value: String) {
         _ui.update { it.copy(hostInput = value, errorMessage = null) }
     }
@@ -77,15 +83,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(portInput = value.filter { ch -> ch.isDigit() }.take(5), errorMessage = null) }
     }
 
-    fun clearMessages() {
-        _ui.update { it.copy(errorMessage = null, statusMessage = null) }
+    fun updatePairPort(value: String) {
+        _ui.update { it.copy(pairPortInput = value.filter { ch -> ch.isDigit() }.take(5), errorMessage = null) }
+    }
+
+    fun updatePairCode(value: String) {
+        _ui.update { it.copy(pairCodeInput = value.filter { ch -> ch.isDigit() }.take(8), errorMessage = null) }
     }
 
     fun connect(host: String? = null, port: Int? = null) {
         val h = (host ?: _ui.value.hostInput).trim()
         val p = port ?: _ui.value.portInput.toIntOrNull() ?: 5555
         if (h.isEmpty()) {
-            _ui.update { it.copy(errorMessage = "请输入电视的 IP 地址，或先扫描设备。") }
+            _ui.update { it.copy(errorMessage = "请输入设备的 IP 地址。") }
             return
         }
         viewModelScope.launch {
@@ -106,7 +116,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         connecting = false,
                         connected = true,
                         connectedEndpoint = "$h:$p",
-                        statusMessage = "已连接 $h:$p。若电视弹出授权提示，请在电视上点「允许」。",
+                        statusMessage = "已连接 $h:$p。若设备弹出授权提示，请点「允许」。",
                         errorMessage = null,
                     )
                 }
@@ -118,6 +128,53 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         connectedEndpoint = null,
                         statusMessage = null,
                         errorMessage = ErrorMessages.humanize(t, h, p),
+                    )
+                }
+            }
+        }
+    }
+
+    fun pairDevice() {
+        val h = _ui.value.hostInput.trim()
+        val pairPort = _ui.value.pairPortInput.toIntOrNull()
+        val code = _ui.value.pairCodeInput.trim()
+        if (h.isEmpty()) {
+            _ui.update { it.copy(errorMessage = "请输入设备 IP 地址。") }
+            return
+        }
+        if (pairPort == null || pairPort <= 0) {
+            _ui.update { it.copy(errorMessage = "请输入配对端口（在「使用配对码配对设备」界面上）。") }
+            return
+        }
+        if (code.length < 5) {
+            _ui.update { it.copy(errorMessage = "请输入设备上显示的配对码（一般为 6 位数字）。") }
+            return
+        }
+        viewModelScope.launch {
+            _ui.update {
+                it.copy(
+                    pairing = true,
+                    errorMessage = null,
+                    statusMessage = "正在配对 $h:$pairPort …",
+                )
+            }
+            try {
+                session.pair(h, pairPort, code)
+                _ui.update {
+                    it.copy(
+                        pairing = false,
+                        statusMessage = "配对成功。请回到「直接连接」，填入无线调试页上的「IP 地址与端口」（连接端口，不是配对端口），再点连接。",
+                        errorMessage = null,
+                        connectMode = ConnectMode.Direct,
+                        pairCodeInput = "",
+                    )
+                }
+            } catch (t: Throwable) {
+                _ui.update {
+                    it.copy(
+                        pairing = false,
+                        statusMessage = null,
+                        errorMessage = ErrorMessages.humanize(t, h, pairPort),
                     )
                 }
             }
@@ -138,69 +195,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun startScan() {
-        scanJob?.cancel()
-        scanJob = viewModelScope.launch {
-            _ui.update {
-                it.copy(
-                    scanning = true,
-                    scanProgress = 0 to 1,
-                    discovered = emptyList(),
-                    errorMessage = null,
-                    statusMessage = "正在扫描局域网，请稍候…",
-                )
-            }
-            try {
-                val keyPair = AdbKeys.loadOrCreate(getApplication())
-                val list = LanScanner.scan(
-                    keyPair = keyPair,
-                    ports = listOf(5555),
-                    onProgress = { phase, done, total ->
-                        val label = when (phase) {
-                            "adb" -> "正在确认是否为可安装的电视/盒子"
-                            else -> "正在扫描局域网端口"
-                        }
-                        _ui.update { state ->
-                            state.copy(
-                                scanProgress = done to total,
-                                statusMessage = "$label（$done / $total）…",
-                            )
-                        }
-                    },
-                )
-                _ui.update {
-                    it.copy(
-                        scanning = false,
-                        scanProgress = null,
-                        discovered = list,
-                        statusMessage = if (list.isEmpty()) {
-                            "未发现已开启网络调试的设备。可检查电视设置，或改用手动输入 IP。"
-                        } else {
-                            "发现 ${list.size} 台可用设备（已排除仅端口开放、不是调试服务的主机），点选即可连接。"
-                        },
-                    )
-                }
-            } catch (t: Throwable) {
-                _ui.update {
-                    it.copy(
-                        scanning = false,
-                        scanProgress = null,
-                        errorMessage = ErrorMessages.humanize(t),
-                        statusMessage = null,
-                    )
-                }
-            }
-        }
-    }
-
-    fun cancelScan() {
-        scanJob?.cancel()
-        scanJob = null
-        _ui.update {
-            it.copy(scanning = false, scanProgress = null, statusMessage = "已停止扫描")
-        }
-    }
-
     fun removeHistory(entry: HostEntry) {
         viewModelScope.launch {
             historyStore.remove(entry.host, entry.port)
@@ -213,7 +207,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update {
                 it.copy(
                     tab = MainTab.Connect,
-                    errorMessage = "请先连接电视，再安装应用。",
+                    errorMessage = "请先连接设备，再安装应用。",
                 )
             }
             return
@@ -263,7 +257,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     },
                 )
             }
-            // refresh apps list quietly
             if (session.isConnected) {
                 runCatching { refreshAppsInternal() }
             }

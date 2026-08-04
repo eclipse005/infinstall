@@ -76,7 +76,7 @@ fun InstallScreen(
                 ) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("尚未连接电视", style = MaterialTheme.typography.titleMedium)
-                        Text("请先在「连接」页扫描或输入 IP。", style = MaterialTheme.typography.bodyLarge)
+                        Text("请先在「连接」页输入 IP 连接（或先配对再连接）。", style = MaterialTheme.typography.bodyLarge)
                         Button(
                             onClick = onGoConnect,
                             modifier = Modifier.heightIn(min = MinTouch),
