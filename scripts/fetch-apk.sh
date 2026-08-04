@@ -20,15 +20,6 @@ if ! command -v gh >/dev/null; then
 fi
 
 echo "→ 等待最新一次 Actions 完成…"
-# 若当前有正在跑的，就盯着它；否则取最近一次
-if gh run list --limit 1 --json databaseId,status,conclusion -q '.[0].status' 2>/dev/null | grep -q in_progress; then
-  gh run watch --exit-status
-else
-  # 没有进行中的也再确认最近一次是否成功
-  :
-fi
-
-# 再 watch 一次确保失败会退出（若已结束则立刻返回）
 RUN_ID="$(gh run list --workflow=android.yml --limit 1 --json databaseId -q '.[0].databaseId')"
 if [[ -z "${RUN_ID}" || "${RUN_ID}" == "null" ]]; then
   echo "没有找到 android.yml 的运行记录。请先 push 触发编译。"
@@ -38,7 +29,8 @@ fi
 STATUS="$(gh run view "$RUN_ID" --json status,conclusion -q '.status + " " + (.conclusion // "")')"
 echo "   run #$RUN_ID  $STATUS"
 
-if [[ "$STATUS" != *completed* ]]; then
+# 仅在仍在跑时 watch；已完成则直接往下
+if [[ "$STATUS" != completed* ]]; then
   gh run watch "$RUN_ID" --exit-status
 fi
 
