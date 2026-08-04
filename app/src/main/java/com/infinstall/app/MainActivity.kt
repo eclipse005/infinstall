@@ -68,11 +68,11 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun streamUriList(intent: Intent): List<Uri> {
-        return if (Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+        val list: ArrayList<Uri>? = if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
         } else {
-            @Suppress("UNCHECKED_CAST")
-            (intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM) as? ArrayList<Uri>).orEmpty()
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
         }
+        return list ?: emptyList()
     }
 }
