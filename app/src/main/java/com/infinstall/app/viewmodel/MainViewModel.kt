@@ -402,7 +402,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             var lastError: String? = null
             try {
-                for ((index, uri) in uris.withIndex()) {
+                uriLoop@ for ((index, uri) in uris.withIndex()) {
                     if (!session.isConnected) {
                         appendImportant("未连接设备")
                         lastError = "未连接设备"
@@ -411,8 +411,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val name = queryDisplayName(uri) ?: "app_${index + 1}.apk"
                     appendImportant(name)
                     try {
-                        resolver.openInputStream(uri)?.use { input ->
-                            session.installApk(input, name, cacheDir) { p ->
+                        val input = resolver.openInputStream(uri)
+                        if (input == null) {
+                            failed++
+                            val msg = "无法读取文件"
+                            lastError = msg
+                            appendImportant("失败：$msg")
+                            continue@uriLoop
+                        }
+                        input.use { stream ->
+                            session.installApk(stream, name, cacheDir) { p ->
                                 // Progress bar only — do not flood installLog
                                 _ui.update {
                                     it.copy(
@@ -421,12 +429,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                                     )
                                 }
                             }
-                        } ?: run {
-                            failed++
-                            val msg = "无法读取文件"
-                            lastError = msg
-                            appendImportant("失败：$msg")
-                            return@for
                         }
                         appendImportant("安装成功")
                     } catch (t: Throwable) {
