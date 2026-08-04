@@ -144,7 +144,7 @@ private fun ConnectForm(
 ) {
     Text("连接电视", style = MaterialTheme.typography.headlineMedium)
     Text(
-        "优先扫描同一 Wi‑Fi 下的设备；也可手输电视 IP。",
+        "优先扫描同一 Wi‑Fi 下已开启网络调试的电视/盒子（会校验，不是端口开了就算）。也可手输 IP。",
         style = MaterialTheme.typography.bodyLarge,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )

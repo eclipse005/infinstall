@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.infinstall.app.adb.AdbKeys
 import com.infinstall.app.adb.DiscoveredDevice
 import com.infinstall.app.adb.ErrorMessages
 import com.infinstall.app.adb.LanScanner
@@ -150,11 +151,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             try {
+                val keyPair = AdbKeys.loadOrCreate(getApplication())
                 val list = LanScanner.scan(
+                    keyPair = keyPair,
                     ports = listOf(5555),
-                    onProgress = { done, total ->
+                    onProgress = { phase, done, total ->
+                        val label = when (phase) {
+                            "adb" -> "正在确认是否为可安装的电视/盒子"
+                            else -> "正在扫描局域网端口"
+                        }
                         _ui.update { state ->
-                            state.copy(scanProgress = done to total)
+                            state.copy(
+                                scanProgress = done to total,
+                                statusMessage = "$label（$done / $total）…",
+                            )
                         }
                     },
                 )
@@ -166,7 +176,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         statusMessage = if (list.isEmpty()) {
                             "未发现已开启网络调试的设备。可检查电视设置，或改用手动输入 IP。"
                         } else {
-                            "发现 ${list.size} 台设备，点选即可连接。"
+                            "发现 ${list.size} 台可用设备（已排除仅端口开放、不是调试服务的主机），点选即可连接。"
                         },
                     )
                 }

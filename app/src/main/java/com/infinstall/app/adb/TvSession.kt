@@ -1,7 +1,6 @@
 package com.infinstall.app.adb
 
 import android.content.Context
-import dadb.AdbKeyPair
 import dadb.Dadb
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -30,20 +29,10 @@ class TvSession(private val appContext: Context) {
 
     val isConnected: Boolean get() = dadb != null
 
-    private fun loadOrCreateKeyPair(): AdbKeyPair {
-        val dir = File(appContext.filesDir, "tv_keys").apply { mkdirs() }
-        val privateKey = File(dir, "key")
-        val publicKey = File(dir, "key.pub")
-        if (!privateKey.exists() || !publicKey.exists()) {
-            AdbKeyPair.generate(privateKey, publicKey)
-        }
-        return AdbKeyPair.read(privateKey, publicKey)
-    }
-
     suspend fun connect(host: String, port: Int) = withContext(Dispatchers.IO) {
         mutex.withLock {
             closeLocked()
-            val keyPair = loadOrCreateKeyPair()
+            val keyPair = AdbKeys.loadOrCreate(appContext)
             val client = Dadb.create(host.trim(), port, keyPair)
             try {
                 // Probe: simple shell; fails fast if unauthorized / not adb
