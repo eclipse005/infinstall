@@ -2,39 +2,42 @@ package com.infinstall.app.adb
 
 object ErrorMessages {
     fun humanize(throwable: Throwable, host: String? = null, port: Int? = null): String {
-        val msg = (throwable.message.orEmpty() + " " + throwable.javaClass.simpleName).lowercase()
+        // Prefer our wrapped messages (already Chinese + detail)
+        val direct = throwable.message
+        if (!direct.isNullOrBlank() && (
+                direct.contains("连不上") ||
+                    direct.contains("配对失败") ||
+                    direct.contains("连接失败") ||
+                    direct.contains("要求先配对") ||
+                    direct.contains("配对码")
+                )
+        ) {
+            return direct
+        }
+
+        val msg = (direct.orEmpty() + " " + throwable.javaClass.simpleName).lowercase()
         val where = when {
             host != null && port != null -> "（$host:$port）"
             host != null -> "（$host）"
             else -> ""
         }
+        val tail = if (!direct.isNullOrBlank()) "\n详情：${throwable.javaClass.simpleName}: $direct" else ""
+
         return when {
-            "pairing" in msg || "pair" in msg && ("fail" in msg || "error" in msg || "exception" in msg) ->
-                "配对失败$where。请确认：电视/设备上已打开「使用配对码配对设备」，配对码未过期，IP 与配对端口抄写正确，且与手机同一 Wi‑Fi。"
-            "pairing required" in msg || "adpairing" in msg || "need pair" in msg ->
-                "需要先配对。Android 11 及以上请用「配对设备」：在无线调试里查看配对码与配对端口，完成配对后再用「直接连接」填连接端口。"
+            "pairing required" in msg || throwable is io.github.muntashirakon.adb.AdbPairingRequiredException ->
+                "需要先配对。平板打开「无线调试 → 使用配对码配对设备」，在弹窗还开着时完成配对，再用连接端口连接。$tail"
+            "tls" in msg || "ssl" in msg || "conscrypt" in msg ->
+                "安全连接（TLS）失败$where。请确认本 App 为最新版，并重装后再试配对。$tail"
             "timeout" in msg || "timed out" in msg ->
-                "连接超时$where。请确认同一 Wi‑Fi，IP/端口正确；无线调试的连接端口与配对端口不是同一个。"
+                "连接超时$where。确认同一 Wi‑Fi、端口正确；配对时弹窗需保持打开。$tail"
             "connection refused" in msg || "refused" in msg || "econnrefused" in msg ->
-                "连接被拒绝$where。端口可能已变（无线调试端口会变），请到设备上重新查看当前 IP 与端口。"
+                "连接被拒绝$where。无线调试端口会变化，请重新查看平板上当前显示的端口。$tail"
             "network is unreachable" in msg || "enotunreach" in msg || "no route" in msg ->
-                "网络不可达$where。请检查是否同一网段。"
-            "failed to connect" in msg || "connect failed" in msg || "unable to connect" in msg || "连接失败" in msg ->
-                "无法连上设备$where。请检查 IP、端口，以及是否已开启网络调试 / 无线调试。"
-            "unauthorized" in msg || "not authorized" in msg || "authentication" in msg && "fail" in msg ->
-                "设备尚未授权本机。若弹出允许调试，请在设备上点允许；Android 11+ 无线调试请先完成配对。"
-            "closed" in msg || "socket closed" in msg || "broken pipe" in msg ->
-                "连接已断开$where。请重新连接。"
-            "permission" in msg && "denied" in msg ->
-                "操作被拒绝。部分系统应用无法卸载，或设备策略限制安装。"
-            "install" in msg && ("fail" in msg || "error" in msg) ->
-                "安装失败：${throwable.message ?: "未知错误"}。请确认 APK 完整且与设备兼容。"
-            "no space" in msg || "enospc" in msg ->
-                "设备存储空间不足，请清理后再安装。"
-            "配对码" in msg ->
-                throwable.message ?: "配对码无效"
+                "网络不可达$where。请确认同一局域网，关闭 VPN/访客 Wi‑Fi。$tail"
+            "unauthorized" in msg || "not authorized" in msg || "authentication" in msg ->
+                "设备未授权本机。无线调试请先配对；若弹出允许调试请点允许。$tail"
             else ->
-                "操作失败${if (throwable.message.isNullOrBlank()) "" else "：${throwable.message}"}。"
+                "操作失败$where${if (direct.isNullOrBlank()) "" else "：$direct"}。"
         }
     }
 }
