@@ -14,6 +14,8 @@ import java.io.InputStream
  * 1. sync SEND APK to /data/local/tmp
  * 2. shell: pm install …
  * 3. shell: rm temp
+ *
+ * Progress labels are **stage** names only (UI progress bar shows %).
  */
 class ApkInstaller(private val session: AdbSession) {
 
@@ -24,7 +26,7 @@ class ApkInstaller(private val session: AdbSession) {
         onProgress: (TransferProgress) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
         session.clearCancel()
-        onProgress(TransferProgress(0f, "准备 $displayName"))
+        onProgress(TransferProgress(0f, "准备中"))
         val local = File(cacheDir, "apk_${System.currentTimeMillis()}.apk")
         try {
             FileOutputStream(local).use { input.copyTo(it) }
@@ -32,31 +34,31 @@ class ApkInstaller(private val session: AdbSession) {
             if (size <= 0L) throw AdbException("APK 为空")
 
             val remote = "/data/local/tmp/infinstall_${System.currentTimeMillis()}.apk"
-            onProgress(TransferProgress(0.02f, "传输中（${size / 1024} KB）"))
+            onProgress(TransferProgress(0.05f, "正在传输"))
+            var lastPct = -1
             session.syncPush(local, remote) { sent, total ->
                 val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
-                onProgress(TransferProgress(0.05f + f * 0.80f, "传输 ${(f * 100).toInt()}%"))
+                // Only update progress fraction; keep stable stage label (no per-% spam)
+                val pct = (f * 100).toInt()
+                if (pct != lastPct) {
+                    lastPct = pct
+                    onProgress(TransferProgress(0.05f + f * 0.80f, "正在传输"))
+                }
             }
 
-            onProgress(TransferProgress(0.90f, "正在安装…"))
+            onProgress(TransferProgress(0.90f, "正在安装"))
             val result = session.shell(
                 "pm install -r -t -g ${session.q(remote)}; echo __EC:\$?",
                 90_000,
             )
             runCatching { session.shell("rm -f ${session.q(remote)}", 8_000) }
 
-            val ok = result.contains("Success", ignoreCase = true) || result.contains("__EC:0")
+            val ok = result.contains("Success", ignoreCase = true) ||
+                Regex("""__EC:0\b""").containsMatchIn(result)
             val fail = result.contains("Failure", ignoreCase = true)
             when {
                 ok && !fail -> onProgress(TransferProgress(1f, "安装成功"))
-                else -> {
-                    val detail = result.lineSequence()
-                        .filter { !it.contains("__EC:") }
-                        .joinToString("\n")
-                        .trim()
-                        .ifBlank { result.trim() }
-                    throw AdbException("安装失败\n$detail")
-                }
+                else -> throw AdbException(InstallErrors.humanize(result))
             }
         } finally {
             local.delete()
@@ -68,12 +70,10 @@ class ApkInstaller(private val session: AdbSession) {
             "pm install -r -t -g ${session.q(remotePath)}; echo __EC:\$?",
             90_000,
         )
-        val ok = result.contains("Success", ignoreCase = true) || result.contains("__EC:0")
+        val ok = result.contains("Success", ignoreCase = true) ||
+            Regex("""__EC:0\b""").containsMatchIn(result)
         if (!ok) {
-            throw AdbException(
-                result.lineSequence().filter { !it.contains("__EC:") }.joinToString("\n")
-                    .ifBlank { "安装失败" },
-            )
+            throw AdbException(InstallErrors.humanize(result))
         }
     }
 }

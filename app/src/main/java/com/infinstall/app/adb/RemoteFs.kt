@@ -95,32 +95,58 @@ class RemoteFs(private val session: AdbSession) {
 
     suspend fun mkdir(path: String) = withContext(Dispatchers.IO) {
         val p = path.trim()
-        val out = session.shell("mkdir -p ${session.q(p)}; echo __EC:\$?", 12_000)
-        requireOk(out, "创建失败", p)
+        val out = session.shell("mkdir -p ${session.q(p)}", 12_000)
+        val lower = out.lowercase()
+        if ("permission denied" in lower || "read-only" in lower || "no such file" in lower) {
+            throw AdbException(cleanErr("创建失败", out, p))
+        }
+        // Verify with sync STAT (reliable); do not depend on shell $? parsing
+        try {
+            val st = session.syncStat(p)
+            if (st.isDir || st.mode != 0) return@withContext
+        } catch (_: Throwable) {
+            // fall through
+        }
+        // STAT all-zero or failed: treat as fail only if shell looked wrong
+        if (lower.isNotBlank() && ("fail" in lower || "error" in lower || "cannot" in lower)) {
+            throw AdbException(cleanErr("创建失败", out, p))
+        }
+        // Re-check: list parent for name
+        val parent = p.substringBeforeLast('/', "")
+        val name = p.substringAfterLast('/')
+        if (parent.isNotEmpty() && name.isNotEmpty()) {
+            val kids = runCatching { session.syncList(parent) }.getOrNull().orEmpty()
+            if (kids.any { it.name == name && it.isDir }) return@withContext
+        }
+        throw AdbException("创建失败（目录未出现）\n$p")
     }
 
     suspend fun rename(from: String, to: String) = withContext(Dispatchers.IO) {
-        val out = session.shell(
-            "mv ${session.q(from)} ${session.q(to)}; echo __EC:\$?",
-            20_000,
-        )
-        requireOk(out, "重命名失败", from)
+        val out = session.shell("mv ${session.q(from)} ${session.q(to)}", 20_000)
+        val lower = out.lowercase()
+        if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
+            throw AdbException(cleanErr("重命名失败", out, from))
+        }
+        val st = runCatching { session.syncStat(to) }.getOrNull()
+        if (st == null || (st.mode == 0 && st.size == 0L)) {
+            throw AdbException(cleanErr("重命名失败", out.ifBlank { "目标不存在" }, from))
+        }
     }
 
     suspend fun copy(from: String, to: String) = withContext(Dispatchers.IO) {
-        val out = session.shell(
-            "cp -a ${session.q(from)} ${session.q(to)}; echo __EC:\$?",
-            120_000,
-        )
-        requireOk(out, "复制失败", from)
+        val out = session.shell("cp -a ${session.q(from)} ${session.q(to)}", 120_000)
+        val lower = out.lowercase()
+        if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
+            throw AdbException(cleanErr("复制失败", out, from))
+        }
     }
 
     suspend fun move(from: String, to: String) = withContext(Dispatchers.IO) {
-        val out = session.shell(
-            "mv ${session.q(from)} ${session.q(to)}; echo __EC:\$?",
-            60_000,
-        )
-        requireOk(out, "移动失败", from)
+        val out = session.shell("mv ${session.q(from)} ${session.q(to)}", 60_000)
+        val lower = out.lowercase()
+        if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
+            throw AdbException(cleanErr("移动失败", out, from))
+        }
     }
 
     /** Official: sync SEND. */

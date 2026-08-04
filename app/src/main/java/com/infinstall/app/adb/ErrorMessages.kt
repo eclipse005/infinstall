@@ -5,6 +5,14 @@ object ErrorMessages {
         // Prefer our wrapped messages (already Chinese + detail)
         val direct = throwable.message.orEmpty()
         if (throwable is AdbException && direct.isNotBlank()) {
+            // Install failures: strip technical pm/__EC noise if still present
+            if (direct.contains("Failure", ignoreCase = true) ||
+                direct.contains("INSTALL_", ignoreCase = true) ||
+                direct.contains("__EC:") ||
+                direct.contains("pm install", ignoreCase = true)
+            ) {
+                return InstallErrors.humanize(direct)
+            }
             return direct
         }
         if (direct.isNotBlank() && (

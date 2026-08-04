@@ -388,25 +388,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             val resolver = getApplication<Application>().contentResolver
             val cacheDir = getApplication<Application>().cacheDir
+            // Detail log: only milestones / errors — never per-% spam (progress bar covers that)
             val logs = mutableListOf<String>()
-            fun append(line: String) {
-                logs.add(line)
+            fun appendImportant(line: String) {
+                val t = line.trim()
+                if (t.isEmpty()) return
+                // Drop pure progress lines if any slip through
+                if (t.matches(Regex("""传输\s*\d+%"""))) return
+                if (t.matches(Regex("""\d+%"""))) return
+                logs.add(t)
                 _ui.update { s -> s.copy(installLog = logs.toList()) }
             }
             var failed = 0
+            var lastError: String? = null
             try {
                 for ((index, uri) in uris.withIndex()) {
                     if (!session.isConnected) {
-                        append("当前未连接，请先连接设备")
+                        appendImportant("未连接设备")
+                        lastError = "未连接设备"
                         break
                     }
                     val name = queryDisplayName(uri) ?: "app_${index + 1}.apk"
-                    append("— $name —")
+                    appendImportant(name)
                     try {
-                        // AdbSession owns op timeouts; do not wrap with withTimeout.
                         resolver.openInputStream(uri)?.use { input ->
                             session.installApk(input, name, cacheDir) { p ->
-                                append(p.label)
+                                // Progress bar only — do not flood installLog
                                 _ui.update {
                                     it.copy(
                                         transferProgress = p.fraction,
@@ -416,14 +423,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             }
                         } ?: run {
                             failed++
-                            append("无法读取 $name")
+                            val msg = "无法读取文件"
+                            lastError = msg
+                            appendImportant("失败：$msg")
+                            return@for
                         }
+                        appendImportant("安装成功")
                     } catch (t: Throwable) {
                         if (t is CancellationException ||
                             t.message?.contains("取消") == true ||
                             t is com.infinstall.app.adb.TransferCancelledException
                         ) {
-                            append("已取消")
+                            appendImportant("已取消")
                             _ui.update {
                                 it.copy(
                                     installing = false,
@@ -435,15 +446,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             return@launch
                         }
                         failed++
-                        append(ErrorMessages.humanize(t))
+                        val msg = ErrorMessages.humanize(t)
+                        lastError = msg
+                        appendImportant(msg)
                     }
+                }
+                val banner = when {
+                    failed == 0 && logs.isNotEmpty() -> "全部安装完成"
+                    failed == 0 -> "安装完成"
+                    uris.size == 1 -> lastError ?: "安装失败"
+                    else -> "完成：成功 ${uris.size - failed}，失败 $failed"
                 }
                 _ui.update {
                     it.copy(
                         installing = false,
                         transferProgress = null,
                         transferLabel = null,
-                        installBanner = if (failed == 0) "全部安装完成" else "完成，失败 $failed 个",
+                        installBanner = banner,
+                        // Single-file failure also shows as error card for visibility
+                        errorMessage = if (failed > 0 && uris.size == 1) lastError else null,
                     )
                 }
             } catch (t: Throwable) {
@@ -457,13 +478,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     throw t
                 }
+                val msg = ErrorMessages.humanize(t)
                 _ui.update {
                     it.copy(
                         installing = false,
                         transferProgress = null,
                         transferLabel = null,
                         installBanner = null,
-                        errorMessage = ErrorMessages.humanize(t),
+                        errorMessage = msg,
+                        installLog = logs + msg,
                     )
                 }
             }

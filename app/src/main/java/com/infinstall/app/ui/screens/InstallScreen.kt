@@ -178,15 +178,26 @@ fun InstallScreen(
             }
         }
 
+        // Detail: only milestone / result lines (no transfer % spam)
         if (state.installLog.isNotEmpty()) {
             item {
                 Text("详情", style = MaterialTheme.typography.titleSmall)
             }
             items(state.installLog) { line ->
+                val isError = line.contains("失败") || line.contains("错误") ||
+                    line.contains("无法") || line.contains("取消")
                 Text(
                     line,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = if (isError) {
+                        MaterialTheme.typography.bodyMedium
+                    } else {
+                        MaterialTheme.typography.bodySmall
+                    },
+                    color = if (isError) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
             }
         }
