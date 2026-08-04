@@ -10,12 +10,11 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 /**
- * Official install path ≈ `adb install`:
- * 1. sync SEND APK to /data/local/tmp
- * 2. shell: pm install …
- * 3. shell: rm temp
+ * Install APK using host-side `adb install` equivalent:
+ * 1) Prefer `cmd package install -S <size>` with APK on stdin
+ * 2) Fallback: sync push to /data/local/tmp + short `shell:pm install`
  *
- * Progress labels are **stage** names only (UI progress bar shows %).
+ * Remote path install: pull/copy to temp then same pipeline (sdcard install is flaky on TV).
  */
 class ApkInstaller(private val session: AdbSession) {
 
@@ -30,50 +29,54 @@ class ApkInstaller(private val session: AdbSession) {
         val local = File(cacheDir, "apk_${System.currentTimeMillis()}.apk")
         try {
             FileOutputStream(local).use { input.copyTo(it) }
-            val size = local.length()
-            if (size <= 0L) throw AdbException("APK 为空")
-
-            val remote = "/data/local/tmp/infinstall_${System.currentTimeMillis()}.apk"
-            onProgress(TransferProgress(0.05f, "正在传输"))
-            var lastPct = -1
-            session.syncPush(local, remote) { sent, total ->
-                val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
-                // Only update progress fraction; keep stable stage label (no per-% spam)
-                val pct = (f * 100).toInt()
-                if (pct != lastPct) {
-                    lastPct = pct
-                    onProgress(TransferProgress(0.05f + f * 0.80f, "正在传输"))
-                }
-            }
-
-            onProgress(TransferProgress(0.90f, "正在安装"))
-            val result = session.shell(
-                "pm install -r -t -g ${session.q(remote)}; echo __EC:\$?",
-                90_000,
-            )
-            runCatching { session.shell("rm -f ${session.q(remote)}", 8_000) }
-
-            val ok = result.contains("Success", ignoreCase = true) ||
-                Regex("""__EC:0\b""").containsMatchIn(result)
-            val fail = result.contains("Failure", ignoreCase = true)
-            when {
-                ok && !fail -> onProgress(TransferProgress(1f, "安装成功"))
-                else -> throw AdbException(InstallErrors.humanize(result))
-            }
+            if (local.length() <= 0L) throw AdbException("APK 为空")
+            runInstallFile(local, onProgress)
         } finally {
             local.delete()
         }
     }
 
     suspend fun installRemotePath(remotePath: String) = withContext(Dispatchers.IO) {
-        val result = session.shell(
-            "pm install -r -t -g ${session.q(remotePath)}; echo __EC:\$?",
-            90_000,
-        )
-        val ok = result.contains("Success", ignoreCase = true) ||
-            Regex("""__EC:0\b""").containsMatchIn(result)
-        if (!ok) {
-            throw AdbException(InstallErrors.humanize(result))
+        session.clearCancel()
+        // Never pm-install directly from /sdcard on many TVs — copy to tmp first via sync pull
+        val cache = File.createTempFile("apk_remote_", ".apk")
+        try {
+            session.syncPull(remotePath, cache) { }
+            if (cache.length() <= 0L) throw AdbException("无法读取远端 APK")
+            runInstallFile(cache) { _, _ -> }
+        } finally {
+            cache.delete()
         }
+    }
+
+    private suspend fun runInstallFile(
+        local: File,
+        onProgress: (TransferProgress) -> Unit,
+    ) {
+        val size = local.length().coerceAtLeast(1)
+        onProgress(TransferProgress(0.05f, "正在传输"))
+        var lastPct = -1
+        val raw = try {
+            session.installApkFile(local) { sent, total ->
+                val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
+                val pct = (f * 100).toInt()
+                if (pct != lastPct) {
+                    lastPct = pct
+                    // 0.05..0.88 for transfer, leave headroom for "installing" if any
+                    onProgress(TransferProgress(0.05f + f * 0.83f, "正在传输"))
+                }
+            }
+        } catch (t: Throwable) {
+            val msg = t.message.orEmpty()
+            throw AdbException(InstallErrors.humanize(msg), t)
+        }
+
+        onProgress(TransferProgress(0.95f, "正在安装"))
+        val ok = raw.contains("Success", ignoreCase = true) &&
+            !raw.contains("Failure", ignoreCase = true)
+        if (!ok) {
+            throw AdbException(InstallErrors.humanize(raw.ifBlank { "安装无输出" }))
+        }
+        onProgress(TransferProgress(1f, "安装成功"))
     }
 }

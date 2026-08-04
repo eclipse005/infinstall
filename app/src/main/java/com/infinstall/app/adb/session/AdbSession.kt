@@ -194,6 +194,23 @@ class AdbSession private constructor(context: Context) {
         onProgress: (got: Long) -> Unit = {},
     ) = syncPull(remotePath, local, onProgress)
 
+    /**
+     * Install local APK file (stdin stream install, fallback push+pm).
+     * @return raw package manager output
+     */
+    suspend fun installApkFile(
+        local: File,
+        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
+    ): String = withContext(Dispatchers.IO) {
+        requireConnected()
+        try {
+            transport.withSerial { transport.installApkFile(local, onProgress) }
+        } catch (t: Throwable) {
+            noteOpError(t)
+            throw t
+        }
+    }
+
     fun q(path: String): String = transport.q(path)
 
     private fun requireConnected(): SessionState.Connected {

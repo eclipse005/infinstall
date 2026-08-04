@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
@@ -187,6 +188,167 @@ class AdbTransport(
             closeQuiet(stream)
             Thread.sleep(30)
         }
+    }
+
+    // ═══════ install (official adb install style) ═══════
+
+    /**
+     * Install APK like `adb install`: prefer stdin streaming (`pm install -S <size>`),
+     * fallback to sync push + short `shell:pm install <path>`.
+     *
+     * @return raw pm/cmd output (Success / Failure […])
+     */
+    fun installApkFile(
+        local: File,
+        onProgress: (sent: Long, total: Long) -> Unit,
+    ): String {
+        ensureLive()
+        checkCancel()
+        val size = local.length()
+        if (size <= 0L) throw AdbException("APK 为空")
+
+        val errors = mutableListOf<String>()
+
+        // 1) Stream install (same idea as host-side adb install)
+        for (dest in listOf(
+            "exec:cmd package install -r -t -d -g -S $size",
+            "exec:pm install -r -t -d -g -S $size",
+        )) {
+            if (dest.length >= 100) continue // libadb OPEN buffer limit ~104
+            try {
+                Log.i(TAG, "install via $dest")
+                val out = timed(180_000) {
+                    installViaStdin(dest, local, size, onProgress)
+                }
+                Log.i(TAG, "install stdin out=${out.take(200)}")
+                if (isInstallSuccess(out)) return out
+                if (out.contains("Failure", ignoreCase = true)) {
+                    // Real package-manager rejection — don't hide behind fallback spam
+                    return out
+                }
+                errors.add("stdin: ${out.take(120)}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "stdin install failed: ${t.message}")
+                errors.add("stdin: ${t.message ?: t.javaClass.simpleName}")
+            }
+        }
+
+        // 2) sync push → short shell:pm install path (ASCII path stays under 104 bytes)
+        try {
+            Log.i(TAG, "install via push+pm")
+            return installViaPushAndPm(local, size, onProgress)
+        } catch (t: Throwable) {
+            Log.w(TAG, "push+pm failed: ${t.message}")
+            errors.add("push+pm: ${t.message ?: t.javaClass.simpleName}")
+            val joined = errors.joinToString(" | ")
+            throw AdbException(joined.ifBlank { t.message ?: "安装失败" }, t)
+        }
+    }
+
+    private fun installViaStdin(
+        dest: String,
+        local: File,
+        size: Long,
+        onProgress: (sent: Long, total: Long) -> Unit,
+    ): String {
+        var stream: AdbStream? = null
+        try {
+            stream = openStreamOnce(dest)
+            val os = stream.openOutputStream()
+            FileInputStream(local).use { fis ->
+                val buf = ByteArray(64 * 1024)
+                var sent = 0L
+                while (true) {
+                    checkCancel()
+                    val n = fis.read(buf)
+                    if (n <= 0) break
+                    os.write(buf, 0, n)
+                    sent += n
+                    onProgress(sent, size)
+                }
+                os.flush()
+            }
+            // -S size: pm stops reading after exact byte count; then prints result
+            return readUntilEofOrResult(stream, maxBytes = 256 * 1024)
+        } finally {
+            closeQuiet(stream)
+            Thread.sleep(40)
+        }
+    }
+
+    private fun installViaPushAndPm(
+        local: File,
+        size: Long,
+        onProgress: (sent: Long, total: Long) -> Unit,
+    ): String {
+        // Short ASCII-only path so shell:pm openStream stays under libadb limit
+        val remote = "/data/local/tmp/ii${System.currentTimeMillis()}.apk"
+        syncPush(local, remote, onProgress)
+        val st = syncStat(remote)
+        if (st.size > 0 && st.size != size) {
+            runCatching { shell("rm -f ${q(remote)}", 5_000) }
+            throw AdbException("传输不完整：本地 ${size}B，远端 ${st.size}B")
+        }
+        // Prefer one-shot shell:cmd (short destination)
+        val oneshot = "pm install -r -t -d -g $remote"
+        val dest = "shell:$oneshot"
+        val out = try {
+            if (dest.length < 100) {
+                timed(90_000) {
+                    var stream: AdbStream? = null
+                    try {
+                        stream = openStreamOnce(dest)
+                        readUntilEofOrResult(stream, 256 * 1024)
+                    } finally {
+                        closeQuiet(stream)
+                    }
+                }
+            } else {
+                shell("$oneshot; echo __EC:\$?", 90_000)
+            }
+        } finally {
+            runCatching { shell("rm -f ${q(remote)}", 8_000) }
+        }
+        Log.i(TAG, "push+pm out=${out.take(200)}")
+        return out
+    }
+
+    private fun readUntilEofOrResult(stream: AdbStream, maxBytes: Int): String {
+        val input = stream.openInputStream()
+        val bos = ByteArrayOutputStream()
+        val buf = ByteArray(4 * 1024)
+        while (bos.size() < maxBytes) {
+            val n = input.read(buf)
+            if (n < 0) break
+            if (n == 0) continue
+            bos.write(buf, 0, n)
+            val s = bos.toString(StandardCharsets.UTF_8.name())
+            // Stop early once we have a definitive result line
+            if (s.contains("Success", ignoreCase = true) ||
+                s.contains("Failure", ignoreCase = true)
+            ) {
+                // Drain a little more for full Failure […] line
+                try {
+                    Thread.sleep(150)
+                    while (input.available() > 0 && bos.size() < maxBytes) {
+                        val m = input.read(buf)
+                        if (m <= 0) break
+                        bos.write(buf, 0, m)
+                    }
+                } catch (_: Exception) {
+                }
+                break
+            }
+        }
+        return bos.toString(StandardCharsets.UTF_8.name()).trim()
+    }
+
+    private fun isInstallSuccess(out: String): Boolean {
+        val lower = out.lowercase()
+        if ("failure" in lower) return false
+        if ("success" in lower) return true
+        // some builds only print nothing + exit 0; rare
+        return false
     }
 
     // ═══════ manager connect ═══════

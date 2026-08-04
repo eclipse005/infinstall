@@ -77,9 +77,9 @@ object InstallErrors {
                 ).find(text)
                 if (bracket != null) {
                     val code = bracket.groupValues[1].trim()
-                    "安装失败：$code"
+                    // Keep code so we can diagnose TV-specific failures
+                    humanizeCode(code)
                 } else {
-                    // Drop technical noise: __EC, pm install paths, stream dump
                     val cleaned = text.lineSequence()
                         .map { it.trim() }
                         .filter { line ->
@@ -87,17 +87,45 @@ object InstallErrors {
                                 !line.contains("__EC:", ignoreCase = true) &&
                                 !line.contains("__INF_", ignoreCase = true) &&
                                 !line.startsWith("pkg:") &&
+                                !line.contains("stdin:", ignoreCase = true) &&
                                 line.length < 200
                         }
-                        .take(3)
+                        .take(2)
                         .joinToString(" ")
-                    if (cleaned.isNotBlank() && cleaned.length < 120) {
-                        "安装失败：$cleaned"
-                    } else {
-                        "安装失败，请重试"
+                    when {
+                        cleaned.contains("Success", ignoreCase = true) -> "安装成功"
+                        cleaned.isNotBlank() && cleaned.length < 100 ->
+                            "安装失败：$cleaned"
+                        else -> "安装失败，请重试（可先卸载旧版后再装）"
                     }
                 }
             }
         }
+    }
+
+    private fun humanizeCode(code: String): String {
+        val c = code.uppercase()
+        val tip = when {
+            "UPDATE_INCOMPATIBLE" in c || "SIGNATURE" in c ->
+                "与已安装版本签名不一致，请先卸载旧版再装"
+            "VERSION_DOWNGRADE" in c ->
+                "不能降级安装，请卸载旧版或使用更高版本"
+            "INSUFFICIENT_STORAGE" in c ->
+                "设备存储空间不足"
+            "ALREADY_EXISTS" in c ->
+                "应用已存在"
+            "INVALID_APK" in c || "PARSE" in c ->
+                "APK 无效或损坏"
+            "OLDER_SDK" in c ->
+                "设备系统版本过低"
+            "USER_RESTRICTED" in c || "VERIFICATION" in c ->
+                "设备限制安装"
+            "ABORTED" in c ->
+                "安装被中止"
+            "DEXOPT" in c ->
+                "设备优化失败，可重启后再试"
+            else -> null
+        }
+        return if (tip != null) "安装失败：$tip（$code）" else "安装失败：$code"
     }
 }
