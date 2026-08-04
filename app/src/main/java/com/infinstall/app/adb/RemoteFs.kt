@@ -4,6 +4,7 @@ import com.infinstall.app.adb.model.AdbException
 import com.infinstall.app.adb.model.RemoteFile
 import com.infinstall.app.adb.model.RemoteFileProps
 import com.infinstall.app.adb.model.TransferProgress
+import com.infinstall.app.adb.session.AdbSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -11,16 +12,13 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 /**
- * Remote filesystem operations — all via [AdbClient].
- *
- * Shell rules: one short command per call; always check exit with `__EC:$?`.
+ * Remote filesystem ops. Failures are operation errors — they do not disconnect [AdbSession].
  */
-class RemoteFs(private val client: AdbClient) {
+class RemoteFs(private val session: AdbSession) {
 
     suspend fun list(path: String): List<RemoteFile> = withContext(Dispatchers.IO) {
         val p = normalize(path)
-        // ls -lA: name + size + perms. (ls -1 only names → UI showed 0K everywhere.)
-        val out = client.shell("ls -lA ${client.q(p)}", 20_000)
+        val out = session.shell("ls -lA ${session.q(p)}", 20_000)
         val lower = out.lowercase()
         if (lower.contains("no such file") || lower.contains("not a directory") ||
             lower.contains("permission denied")
@@ -37,7 +35,7 @@ class RemoteFs(private val client: AdbClient) {
 
     suspend fun props(path: String): RemoteFileProps = withContext(Dispatchers.IO) {
         val p = path.trim()
-        val out = client.shell("ls -ld ${client.q(p)}", 12_000)
+        val out = session.shell("ls -ld ${session.q(p)}", 12_000)
         val line = out.lineSequence()
             .map { it.trimEnd('\r').trim() }
             .firstOrNull { it.isNotEmpty() && !it.startsWith("total") }
@@ -70,45 +68,40 @@ class RemoteFs(private val client: AdbClient) {
 
     suspend fun delete(path: String) = withContext(Dispatchers.IO) {
         val p = path.trim()
-        val out = client.shell("rm -rf ${client.q(p)}; echo __EC:\$?", 30_000)
-        val ec = exitCode(out)
-        // verify gone even if shell exit is flaky
-        val check = client.shell("ls -ld ${client.q(p)} 2>&1; echo __EC:\$?", 8_000)
+        val out = session.shell("rm -rf ${session.q(p)}; echo __EC:\$?", 30_000)
+        val check = session.shell("ls -ld ${session.q(p)} 2>&1; echo __EC:\$?", 8_000)
         val stillThere = !check.contains("No such", ignoreCase = true) &&
             check.lineSequence().any { LsParser.parseLongLine(it) != null }
         if (stillThere) {
-            throw AdbException(
-                cleanErr("删除失败（可能无权限）", out, p) +
-                    if (ec != null) " [ec=$ec]" else "",
-            )
+            throw AdbException(cleanErr("删除失败（可能无权限）", out, p))
         }
     }
 
     suspend fun mkdir(path: String) = withContext(Dispatchers.IO) {
         val p = path.trim()
-        val out = client.shell("mkdir -p ${client.q(p)}; echo __EC:\$?", 12_000)
+        val out = session.shell("mkdir -p ${session.q(p)}; echo __EC:\$?", 12_000)
         requireOk(out, "创建失败", p)
     }
 
     suspend fun rename(from: String, to: String) = withContext(Dispatchers.IO) {
-        val out = client.shell(
-            "mv ${client.q(from)} ${client.q(to)}; echo __EC:\$?",
+        val out = session.shell(
+            "mv ${session.q(from)} ${session.q(to)}; echo __EC:\$?",
             20_000,
         )
         requireOk(out, "重命名失败", from)
     }
 
     suspend fun copy(from: String, to: String) = withContext(Dispatchers.IO) {
-        val out = client.shell(
-            "cp -a ${client.q(from)} ${client.q(to)}; echo __EC:\$?",
+        val out = session.shell(
+            "cp -a ${session.q(from)} ${session.q(to)}; echo __EC:\$?",
             120_000,
         )
         requireOk(out, "复制失败", from)
     }
 
     suspend fun move(from: String, to: String) = withContext(Dispatchers.IO) {
-        val out = client.shell(
-            "mv ${client.q(from)} ${client.q(to)}; echo __EC:\$?",
+        val out = session.shell(
+            "mv ${session.q(from)} ${session.q(to)}; echo __EC:\$?",
             60_000,
         )
         requireOk(out, "移动失败", from)
@@ -120,14 +113,14 @@ class RemoteFs(private val client: AdbClient) {
         cacheDir: File,
         onProgress: (TransferProgress) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
-        client.clearCancel()
+        session.clearCancel()
         val cache = File(cacheDir, "up_${System.currentTimeMillis()}.bin")
         try {
             FileOutputStream(cache).use { input.copyTo(it) }
             val total = cache.length()
             if (total <= 0L) throw AdbException("本地文件为空")
             onProgress(TransferProgress(0f, "开始传输 ${total / 1024} KB"))
-            client.push(cache, remotePath) { sent, t ->
+            session.push(cache, remotePath) { sent, t ->
                 val f = (sent.toFloat() / t.coerceAtLeast(1)).coerceIn(0f, 1f)
                 onProgress(TransferProgress(f, "传输 ${(f * 100).toInt()}%"))
             }
@@ -141,7 +134,7 @@ class RemoteFs(private val client: AdbClient) {
         remotePath: String,
         local: File,
         onProgress: (got: Long) -> Unit = {},
-    ) = client.pull(remotePath, local, onProgress)
+    ) = session.pull(remotePath, local, onProgress)
 
     private fun normalize(path: String): String {
         val p = path.trim().ifEmpty { "/sdcard" }
@@ -159,7 +152,6 @@ class RemoteFs(private val client: AdbClient) {
             ec == 0 -> return
             ec != null -> throw AdbException(cleanErr(prefix, out, path) + " [ec=$ec]")
             else -> {
-                // Marker missing = shell stream likely cut off; do not treat as success.
                 val lower = out.lowercase()
                 if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
                     throw AdbException(cleanErr(prefix, out, path))
@@ -179,15 +171,6 @@ class RemoteFs(private val client: AdbClient) {
     }
 }
 
-/**
- * Parse Android toybox/toolbox `ls -l` / `ls -ld` lines.
- *
- * Examples:
- *  -rw-rw---- 1 u0_a123 media_rw 29136 2024-08-04 03:14 file.apk
- *  drwxrwx--x 2 u0_a123 media_rw  3452 2024-08-01 12:00 Download
- *  -rw-r--r-- 1 root root 123 Jan  1  2020 old.txt
- *  lrwxrwxrwx 1 root root 21 2024-01-01 00:00 sdcard -> /storage/self/primary
- */
 object LsParser {
     fun parseLongLine(line: String): RemoteFile? {
         val trimmed = line.trim()
@@ -206,7 +189,6 @@ object LsParser {
         val tokens = rest.split(Regex("\\s+"))
         if (tokens.size < 5) return null
 
-        // nlink owner group size date...
         var sizeIdx = 3
         var size = tokens.getOrNull(sizeIdx)?.toLongOrNull()
         if (size == null) {
@@ -224,29 +206,24 @@ object LsParser {
             val t = tokens[nameStart]
             when {
                 t.matches(Regex("\\d{4}-\\d{2}-\\d{2}")) -> {
-                    // 2024-08-04 03:14 name
                     mtimeSec = parseIsoDateTime(
                         tokens.getOrNull(nameStart),
                         tokens.getOrNull(nameStart + 1),
                     )
                     nameStart += 2
                 }
-                t.matches(Regex("[A-Za-z]{3}")) -> {
-                    // Jan  1 2020 or Jan 1 03:14
-                    nameStart += 3
-                }
+                t.matches(Regex("[A-Za-z]{3}")) -> nameStart += 3
                 else -> nameStart += 2
             }
         }
         if (nameStart >= tokens.size) return null
         var name = tokens.subList(nameStart, tokens.size).joinToString(" ")
-        if (isLink && " -> " in name) name = name.substringBefore(" -> ")
-        // toybox sometimes prints "name -> target" with single spaces already split —
-        // re-join may have lost " -> "; also handle token form: name -> target
         if (isLink) {
             val arrow = tokens.indexOf("->")
             if (arrow > nameStart) {
                 name = tokens.subList(nameStart, arrow).joinToString(" ")
+            } else if (" -> " in name) {
+                name = name.substringBefore(" -> ")
             }
         }
         name = name.trim().trimEnd('/')

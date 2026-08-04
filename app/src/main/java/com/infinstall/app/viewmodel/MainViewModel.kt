@@ -9,6 +9,7 @@ import com.infinstall.app.adb.ErrorMessages
 import com.infinstall.app.adb.RemoteFile
 import com.infinstall.app.adb.RemoteFileProps
 import com.infinstall.app.adb.TvSession
+import com.infinstall.app.adb.model.SessionState
 import com.infinstall.app.data.ConnectionHistoryStore
 import com.infinstall.app.data.HostEntry
 import com.infinstall.app.util.LocalNetwork
@@ -20,7 +21,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.FileInputStream
 
@@ -93,8 +93,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
-    private var heartbeatJob: Job? = null
     private var transferJob: Job? = null
+    /** True while user-initiated connect/pair in flight (UI spinner). */
+    private var userConnectInFlight = false
 
     init {
         viewModelScope.launch {
@@ -102,12 +103,59 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { it.copy(history = list) }
             }
         }
+        // Single source of truth: AdbSession state machine → UI connected flag.
+        // Operation errors do NOT change this. Only connect/disconnect/transport-dead do.
+        viewModelScope.launch {
+            session.state.collect { st ->
+                when (st) {
+                    is SessionState.Connected -> {
+                        if (!userConnectInFlight) {
+                            _ui.update {
+                                it.copy(
+                                    connected = true,
+                                    connectedEndpoint = st.endpoint,
+                                    connecting = false,
+                                )
+                            }
+                        }
+                    }
+                    is SessionState.Connecting -> {
+                        _ui.update {
+                            it.copy(
+                                connecting = true,
+                                connectBanner = "正在连接 ${st.host}:${st.port} …",
+                            )
+                        }
+                    }
+                    is SessionState.Pairing -> {
+                        _ui.update {
+                            it.copy(pairing = true, connectBanner = "配对中…")
+                        }
+                    }
+                    SessionState.Disconnected -> {
+                        // Do not clear banners/errors here if user is mid-connect attempt —
+                        // connect() catch block owns failure UI.
+                        if (!userConnectInFlight && _ui.value.connected) {
+                            _ui.update {
+                                it.copy(
+                                    connected = false,
+                                    connectedEndpoint = null,
+                                    connecting = false,
+                                    pairing = false,
+                                    // Soft notice only when we were connected and session dropped
+                                    connectBanner = it.connectBanner ?: "连接已结束",
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Prefill IP with this phone's Wi‑Fi subnet (e.g. 192.168.1.) so user only edits last digits
         viewModelScope.launch(Dispatchers.IO) {
             val localIp = LocalNetwork.primaryIpv4(getApplication())
             val suggested = LocalNetwork.suggestedHostInput(getApplication())
             _ui.update { state ->
-                // Don't overwrite if user already typed or history restored something
                 val host = if (state.hostInput.isBlank()) suggested else state.hostInput
                 state.copy(hostInput = host, localIpv4 = localIp)
             }
@@ -181,7 +229,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         viewModelScope.launch {
-            stopHeartbeat()
+            userConnectInFlight = true
             _ui.update {
                 it.copy(
                     connecting = true,
@@ -193,7 +241,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             try {
-                withTimeout(45_000) { session.connect(h, p) }
+                // No outer withTimeout — AdbSession owns timeouts; cancel would race the mutex.
+                session.connect(h, p)
                 historyStore.rememberSuccess(h, p)
                 _ui.update {
                     it.copy(
@@ -202,11 +251,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         connectedEndpoint = "$h:$p",
                         connectBanner = null,
                         errorMessage = null,
-                        // 连上后直接去装包
                         tab = MainTab.Install,
                     )
                 }
-                startHeartbeat()
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
                 _ui.update {
@@ -218,6 +265,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         errorMessage = ErrorMessages.humanize(t, h, p),
                     )
                 }
+            } finally {
+                userConnectInFlight = false
             }
         }
     }
@@ -239,16 +288,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         viewModelScope.launch {
+            userConnectInFlight = true
             _ui.update { it.copy(pairing = true, errorMessage = null, connectBanner = "配对中…") }
             try {
-                withTimeout(60_000) { session.pair(h, pairPort, code) }
-                // After wireless pairing, connect port is NEVER the pair port, and usually
-                // NOT 5555 either — force re-entry of the port shown at top of 无线调试.
+                session.pair(h, pairPort, code)
                 _ui.update {
                     it.copy(
                         pairing = false,
                         connectBanner = "配对成功！请填上方「连接端口」" +
-                            "（打开无线调试主页顶部 IP:端口，不是配对端口 $pairPort；也不是 5555）",
+                            "（无线调试主页顶部 IP:端口，不是配对端口 $pairPort）",
                         connectMode = ConnectMode.Direct,
                         pairCodeInput = "",
                         portInput = "",
@@ -265,6 +313,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         errorMessage = ErrorMessages.humanize(t, h, pairPort),
                     )
                 }
+            } finally {
+                userConnectInFlight = false
             }
         }
     }
@@ -272,7 +322,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnect() {
         viewModelScope.launch {
             cancelTransfer()
-            stopHeartbeat()
             session.disconnect()
             _ui.update {
                 it.copy(
@@ -284,6 +333,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     transferring = false,
                     transferProgress = null,
                     transferLabel = null,
+                    errorMessage = null,
                 )
             }
         }
@@ -293,7 +343,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         session.requestCancel()
         transferJob?.cancel()
         transferJob = null
-        // Read flags BEFORE clearing — previously copy used already-false fields, so banners never updated.
         _ui.update { s ->
             val wasInstalling = s.installing
             val wasTransferring = s.transferring
@@ -304,45 +353,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 transferLabel = null,
                 installBanner = if (wasInstalling) "已取消安装" else s.installBanner,
                 filesBanner = if (wasTransferring) "已取消传输" else s.filesBanner,
-            )
-        }
-    }
-
-    /**
-     * Heartbeat removed: it was a major source of false "连接已失效".
-     * Session lifetime is owned by explicit connect/disconnect + AdbClient.linked.
-     */
-    private fun startHeartbeat() {
-        stopHeartbeat()
-        // intentionally empty — do not poll manager.isConnected / do not auto-disconnect
-    }
-
-    private fun stopHeartbeat() {
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-    }
-
-    /**
-     * Only for **proven** transport death (openStream failed and linked cleared).
-     * Never call this for a single file op timeout / parse error / permission error.
-     */
-    private fun softUnlinkIfDead(reason: String) {
-        if (session.isConnected) return
-        stopHeartbeat()
-        transferJob?.cancel()
-        _ui.update {
-            it.copy(
-                connected = false,
-                connectedEndpoint = null,
-                connecting = false,
-                installing = false,
-                transferring = false,
-                filesLoading = false,
-                transferProgress = null,
-                transferLabel = null,
-                errorMessage = reason,
-                // Stay on current tab if possible — less jarring; user can go to Connect
-                connectBanner = null,
             )
         }
     }
@@ -388,13 +398,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 for ((index, uri) in uris.withIndex()) {
                     if (!session.isConnected) {
                         append("当前未连接，请先连接设备")
-                        softUnlinkIfDead("未连接设备")
                         break
                     }
                     val name = queryDisplayName(uri) ?: "app_${index + 1}.apk"
                     append("— $name —")
                     try {
-                        // No outer withTimeout — AdbClient has its own; outer cancel races mutex.
+                        // AdbSession owns op timeouts; do not wrap with withTimeout.
                         resolver.openInputStream(uri)?.use { input ->
                             session.installApk(input, name, cacheDir) { p ->
                                 append(p.label)
@@ -427,7 +436,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         failed++
                         append(ErrorMessages.humanize(t))
-                        softUnlinkIfDead("连接已中断，请重新连接")
                     }
                 }
                 _ui.update {
@@ -468,7 +476,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(filesLoading = true, filesBanner = null) }
             try {
                 val path = _ui.value.remotePath
-                // Rely on AdbClient timeout only — outer withTimeout cancels mid-mutex → chaos
+                // AdbSession owns list timeout.
                 val list = session.listDir(path)
                 _ui.update {
                     it.copy(
@@ -485,7 +493,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         filesBanner = "无法列出文件：${ErrorMessages.humanize(t)}",
                     )
                 }
-                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -549,7 +556,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 for (uri in uris) {
                     if (!session.isConnected) {
-                        softUnlinkIfDead("未连接设备")
                         break
                     }
                     val name = queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}"
@@ -582,7 +588,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         failed++
                         _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
-                        softUnlinkIfDead("连接已中断，请重新连接")
                     }
                 }
                 _ui.update {
@@ -627,7 +632,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(filesBanner = ErrorMessages.humanize(t), filesLoading = false)
                 }
-                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -717,7 +721,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
                 }
-                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -833,7 +836,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
                 }
-                softUnlinkIfDead("连接已中断，请重新连接")
             }
         }
     }
@@ -850,7 +852,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        stopHeartbeat()
         transferJob?.cancel()
         session.requestCancel()
         super.onCleared()

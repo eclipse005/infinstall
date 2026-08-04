@@ -1,68 +1,92 @@
-# Infinstall ADB 框架说明（给后续改动看）
+# Infinstall ADB 健壮性最佳实践
 
-## 分层（只允许单向依赖）
+## 你的理解是对的
+
+> 连接成功后，只要对端 adbd 还在、网络还在，**会话就应该一直保持 Connected**。
+
+超时、列目录失败、删除无权限、安装失败 —— 这些都是**操作失败**，不是断线。
+
+## 分层
 
 ```
 UI / MainViewModel
-        ↓
-    TvSession          # 门面，禁止 openStream
-        ↓
- RemoteFs | ApkInstaller
-        ↓
-    AdbClient          # 唯一 openStream / shell / push / pull
-        ↓
- InfinstallAdbManager  # libadb 密钥 + connect/pair
+        │  只观察 SessionState，禁止自己“判死”
+        ▼
+    TvSession          门面
+        ▼
+    AdbSession         ★ 唯一生命周期所有者（状态机）
+        ▼
+    AdbTransport       唯一 openStream / shell / push / pull
+        ▼
+ InfinstallAdbManager  libadb 密钥与底层 connect/pair
 ```
 
-**硬规则：**
+| 组件 | 职责 |
+|------|------|
+| `SessionState` | Disconnected / Connecting / Pairing / Connected |
+| `AdbSession` | connect / pair / disconnect；暴露 `StateFlow` |
+| `AdbTransport` | 串行 I/O、超时、结束标记 shell |
+| `RemoteFs` / `ApkInstaller` | 业务；失败只抛错 |
 
-1. 只有 `AdbClient` 可以 `openStream` / 碰 `InfinstallAdbManager` 的数据面。
-2. 同一时刻只允许一个操作（`mutex`）。
-3. Shell 必须是**单行**命令；不要嵌套超时包超时。
-4. 任何 `AdbStream` 必须在 `finally` 里关闭。
-5. **已连接时禁止再开第二条 TCP 去探测 adbd**（单客户端 adbd 会误杀会话）。
-6. 连接成功后：**先写入 host/port + linked，再 shell 探测**。
-7. **超时 / 单次操作失败 ≠ 断开会话**。禁止在 ViewModel 里因 list/delete 失败就 `markRemoteGone`。
-8. **禁止心跳自动 disconnect**。`linked` 是 UI 连接态真源，`manager.isConnected` 不可靠。
-9. Shell 用 `__INF_END__` 结束标记，不要干等 stream EOF。
-10. ViewModel **不要**再包一层 `withTimeout` 包住持 mutex 的 ADB 调用（会取消协程、打乱流）。
-
-## 连接状态机
+## 状态机（硬规则）
 
 ```
-空闲 → tcpCheck → manager.connect → 写 host/port → shell probe → 已连接
-         ↘ 失败：disconnect，host/port=null
-已连接 → shell/push/pull（持 mutex）
-超时 / Stream closed → disconnect，要求用户重连
+Disconnected
+    │ connect()
+    ▼
+Connecting ──失败──► Disconnected
+    │ 成功（握手 + 写状态 + probe）
+    ▼
+Connected  ◄────────────────────────────┐
+    │                                    │
+    │  任意 shell/push/pull 超时或业务错  │  只记 lastError
+    │  ─────────────────────────────────►│  仍为 Connected
+    │                                    │
+    │  用户 disconnect()                 │
+    └──────────────────────────────────► Disconnected
+    │
+    │  openStream 证实传输层已死
+    │  （reset / broken pipe / socket closed）
+    └──────────────────────────────────► Disconnected
 ```
 
-- `isConnected` = `host != null && port != null && manager.isConnected`
-- `ensureConnected()` 只看 `manager.isConnected`（数据面）
-- 配对（pair）≠ 连接（connect）；**配对端口 ≠ 连接端口**
+### 禁止
+
+1. 心跳 / 轮询 `manager.isConnected` 后自动 disconnect  
+2. 超时后 disconnect  
+3. 列表/删除/安装失败后 `markRemoteGone`  
+4. ViewModel 再包一层 `withTimeout` 包住持锁 ADB 调用  
+5. 已连接时再开第二条 TCP 探 adbd  
+
+### 允许离开 Connected 的路径
+
+1. 用户点「断开」  
+2. 再次 `connect()` 前清理旧会话  
+3. **确定性**传输死亡（`openStream` 抛出 reset/broken pipe 等）  
+
+## Shell 约定
+
+- 单行命令  
+- 自动追加 `; echo __INF_END__`，读到标记即结束（不干等 EOF）  
+- 写操作用 `__EC:$?` 校验  
+
+## ViewModel 约定
+
+- `connected` UI 标志跟随 `session.state`  
+- 操作失败 → 横幅/日志文案，**顶栏仍显示已连接**  
+- 只有 `Disconnected` 且此前是已连接时，才提示「连接已结束」  
 
 ## 无线调试 vs 5555
 
 | 场景 | 端口 |
 |------|------|
-| 经典 adbd 网络调试（电视常见） | 多为 **5555**，一般无需配对 |
-| Android 11+「无线调试」 | 先 pair(配对端口+码)，再 connect(**主页顶部连接端口**) |
-
-## 历史事故（禁止重演）
-
-| 症状 | 根因 |
-|------|------|
-| 文件大小全 0K | `ls -1` 只有名字 → 必须用 `ls -lA` |
-| 假「设备已断开」 | 已连接时再 TCP 探测 adbd |
-| Stream closed / 操作半死 | 多行 shell、嵌套 timeout、流未关 |
-| 配对成功却「未连接设备」 | connect 里 probe 前未写 host，且 shell 检查 host |
-| 取消无提示 | `copy` 里先清 flag 再读 flag |
+| 电视网络调试 | 多为 5555，常无需配对 |
+| 无线调试 | pair(配对端口) → connect(**主页顶部连接端口**) |
 
 ## 改动检查清单
 
-- [ ] 新 shell 是否单行？是否有 `__EC:$?` 或等价校验？
-- [ ] 是否只通过 `AdbClient` 开流？
-- [ ] connect 路径是否在任何 shell 前设置了 host/port？
-- [ ] 失败时是否会错误地 `markRemoteGone`（单文件失败 ≠ 断连）？
-- [ ] 超时后会话是否清干净？
-- [ ] UI 默认端口 5555；配对成功后是否引导填「连接端口」？
-- [ ] 本地无法完整编 Android 时，至少过一遍上述状态机 + CI 构建
+- [ ] 是否只在 `AdbSession` 改 `SessionState`？  
+- [ ] 超时是否只抛 `AdbException`、不 disconnect？  
+- [ ] ViewModel 失败路径是否仍保持 `connected=true`（若 session 仍 Connected）？  
+- [ ] 是否新增了心跳杀会话？  
+- [ ] Shell 是否单行 + 结束标记？  

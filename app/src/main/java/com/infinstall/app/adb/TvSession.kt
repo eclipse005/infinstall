@@ -3,46 +3,36 @@ package com.infinstall.app.adb
 import android.content.Context
 import com.infinstall.app.adb.model.RemoteFile
 import com.infinstall.app.adb.model.RemoteFileProps
+import com.infinstall.app.adb.model.SessionState
 import com.infinstall.app.adb.model.TransferProgress
+import com.infinstall.app.adb.session.AdbSession
+import kotlinx.coroutines.flow.StateFlow
 import java.io.File
 import java.io.InputStream
 
 /**
- * Thin facade for ViewModel. All real work goes through the unified stack:
- * [AdbClient] (transport) → [RemoteFs] / [ApkInstaller] (ops).
- *
- * Do not open AdbStream or shell here.
+ * App-facing facade. Session lifecycle is entirely owned by [AdbSession].
  */
 class TvSession(appContext: Context) {
-    private val client = AdbClient.get(appContext)
-    private val fs = RemoteFs(client)
-    private val installer = ApkInstaller(client)
+    private val session = AdbSession.get(appContext)
+    private val fs = RemoteFs(session)
+    private val installer = ApkInstaller(session)
 
-    val host: String? get() = client.host
-    val port: Int? get() = client.port
-    val isConnected: Boolean get() = client.isConnected
+    val state: StateFlow<SessionState> get() = session.state
+    val host: String? get() = session.host
+    val port: Int? get() = session.port
+    val isConnected: Boolean get() = session.isConnected
 
-    fun requestCancel() = client.requestCancel()
-    fun clearCancel() = client.clearCancel()
-    fun isSessionUp(): Boolean = client.isConnected
-    fun isTcpAlive(): Boolean = client.isConnected
+    fun requestCancel() = session.requestCancel()
+    fun clearCancel() = session.clearCancel()
+    fun isSessionUp(): Boolean = session.isConnected
 
     suspend fun pair(host: String, pairingPort: Int, pairingCode: String) =
-        client.pair(host, pairingPort, pairingCode)
+        session.pair(host, pairingPort, pairingCode)
 
-    suspend fun connect(host: String, port: Int) = client.connect(host, port)
+    suspend fun connect(host: String, port: Int) = session.connect(host, port)
 
-    suspend fun disconnect() = client.disconnect()
-
-    /** Soft in-band ping; returns false on failure without killing the session. */
-    suspend fun pingInBand(): Boolean {
-        if (!client.isConnected) return false
-        return try {
-            client.shell("echo ping_ok", 5_000).contains("ping_ok")
-        } catch (_: Throwable) {
-            false
-        }
-    }
+    suspend fun disconnect() = session.disconnect()
 
     suspend fun installApk(
         input: InputStream,

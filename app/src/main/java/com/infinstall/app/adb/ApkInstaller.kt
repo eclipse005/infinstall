@@ -2,6 +2,7 @@ package com.infinstall.app.adb
 
 import com.infinstall.app.adb.model.AdbException
 import com.infinstall.app.adb.model.TransferProgress
+import com.infinstall.app.adb.session.AdbSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -9,9 +10,9 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 /**
- * Install APK over the unified [AdbClient].
+ * APK install. Failures do not disconnect the session.
  */
-class ApkInstaller(private val client: AdbClient) {
+class ApkInstaller(private val session: AdbSession) {
 
     suspend fun install(
         input: InputStream,
@@ -19,7 +20,7 @@ class ApkInstaller(private val client: AdbClient) {
         cacheDir: File,
         onProgress: (TransferProgress) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
-        client.clearCancel()
+        session.clearCancel()
         onProgress(TransferProgress(0f, "准备 $displayName"))
         val local = File(cacheDir, "apk_${System.currentTimeMillis()}.apk")
         try {
@@ -29,17 +30,17 @@ class ApkInstaller(private val client: AdbClient) {
 
             val remote = "/data/local/tmp/infinstall_${System.currentTimeMillis()}.apk"
             onProgress(TransferProgress(0.02f, "传输中（${size / 1024} KB）"))
-            client.push(local, remote) { sent, total ->
+            session.push(local, remote) { sent, total ->
                 val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
                 onProgress(TransferProgress(0.05f + f * 0.80f, "传输 ${(f * 100).toInt()}%"))
             }
 
             onProgress(TransferProgress(0.90f, "正在安装…"))
-            val result = client.shell(
-                "pm install -r -t -g ${client.q(remote)}; echo __EC:\$?",
+            val result = session.shell(
+                "pm install -r -t -g ${session.q(remote)}; echo __EC:\$?",
                 90_000,
             )
-            runCatching { client.shell("rm -f ${client.q(remote)}", 8_000) }
+            runCatching { session.shell("rm -f ${session.q(remote)}", 8_000) }
 
             val ok = result.contains("Success", ignoreCase = true) || result.contains("__EC:0")
             val fail = result.contains("Failure", ignoreCase = true)
@@ -60,8 +61,8 @@ class ApkInstaller(private val client: AdbClient) {
     }
 
     suspend fun installRemotePath(remotePath: String) = withContext(Dispatchers.IO) {
-        val result = client.shell(
-            "pm install -r -t -g ${client.q(remotePath)}; echo __EC:\$?",
+        val result = session.shell(
+            "pm install -r -t -g ${session.q(remotePath)}; echo __EC:\$?",
             90_000,
         )
         val ok = result.contains("Success", ignoreCase = true) || result.contains("__EC:0")
