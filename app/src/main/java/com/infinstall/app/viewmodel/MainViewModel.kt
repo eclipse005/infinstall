@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.infinstall.app.adb.ErrorMessages
 import com.infinstall.app.adb.RemoteFile
+import com.infinstall.app.adb.RemoteFileProps
 import com.infinstall.app.adb.TvSession
 import com.infinstall.app.data.ConnectionHistoryStore
 import com.infinstall.app.data.HostEntry
@@ -23,6 +24,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.io.File
+import java.io.FileInputStream
 
 enum class MainTab {
     Connect,
@@ -60,6 +63,26 @@ data class UiState(
     val files: List<RemoteFile> = emptyList(),
     val filesBanner: String? = null,
     val transferring: Boolean = false,
+    val fileSort: FileSort = FileSort.NameAsc,
+    val clipboard: FileClipboard? = null,
+    val propsLoading: Boolean = false,
+    val fileProps: RemoteFileProps? = null,
+    /** Local path after pull, for system share/open */
+    val lastDownloadedLocalPath: String? = null,
+)
+
+enum class FileSort {
+    NameAsc,
+    NameDesc,
+    SizeDesc,
+    TimeDesc,
+}
+
+data class FileClipboard(
+    val path: String,
+    val name: String,
+    val isDir: Boolean,
+    val isCut: Boolean,
 )
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
@@ -360,7 +383,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val path = _ui.value.remotePath
                 val list = withTimeout(25_000) { session.listDir(path) }
                 _ui.update {
-                    it.copy(filesLoading = false, files = list, filesBanner = null)
+                    it.copy(
+                        filesLoading = false,
+                        files = sortFiles(list, it.fileSort),
+                        filesBanner = null,
+                    )
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
@@ -378,23 +405,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setFileSort(sort: FileSort) {
+        _ui.update { state ->
+            state.copy(fileSort = sort, files = sortFiles(state.files, sort))
+        }
+    }
+
+    private fun sortFiles(list: List<RemoteFile>, sort: FileSort): List<RemoteFile> {
+        val dirsFirst = compareBy<RemoteFile> { !it.isDir }
+        return when (sort) {
+            FileSort.NameAsc -> list.sortedWith(dirsFirst.thenBy { it.name.lowercase() })
+            FileSort.NameDesc -> list.sortedWith(dirsFirst.thenByDescending { it.name.lowercase() })
+            FileSort.SizeDesc -> list.sortedWith(dirsFirst.thenByDescending { it.size })
+            FileSort.TimeDesc -> list.sortedWith(dirsFirst.thenByDescending { it.mtimeSec })
+        }
+    }
+
     fun openRemoteDir(name: String) {
         val cur = _ui.value.remotePath.trimEnd('/')
-        val next = "$cur/$name"
+        val next = if (cur.isEmpty() || cur == "/") "/$name" else "$cur/$name"
         _ui.update { it.copy(remotePath = next, files = emptyList()) }
         refreshFiles()
     }
 
     fun goUpRemote() {
         val cur = _ui.value.remotePath.trimEnd('/')
-        if (cur.isEmpty() || cur == "/" || cur == "/sdcard") return
-        val parent = cur.substringBeforeLast('/', "/sdcard").ifEmpty { "/sdcard" }
-        _ui.update { it.copy(remotePath = parent, files = emptyList()) }
+        if (cur.isEmpty() || cur == "/") return
+        val parent = if (!cur.contains('/')) "/"
+        else cur.substringBeforeLast('/').ifEmpty { "/" }
+        _ui.update { it.copy(remotePath = parent.ifEmpty { "/" }, files = emptyList()) }
         refreshFiles()
     }
 
     fun setRemotePath(path: String) {
-        _ui.update { it.copy(remotePath = path.trim().ifEmpty { "/sdcard/Download" }, files = emptyList()) }
+        val p = path.trim().ifEmpty { "/sdcard/Download" }
+        _ui.update { it.copy(remotePath = p, files = emptyList()) }
         refreshFiles()
     }
 
@@ -403,7 +448,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _ui.update { it.copy(transferring = true, filesBanner = null, tab = MainTab.Files) }
             val resolver = getApplication<Application>().contentResolver
-            val base = _ui.value.remotePath.trimEnd('/')
+            val base = _ui.value.remotePath.trimEnd('/').ifEmpty { "/sdcard" }
             var failed = 0
             try {
                 for (uri in uris) {
@@ -430,7 +475,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         transferring = false,
-                        filesBanner = if (failed == 0) "传输完成" else "完成，失败 $failed",
+                        filesBanner = if (failed == 0) "上传完成" else "上传完成，失败 $failed",
                     )
                 }
                 refreshFiles()
@@ -446,15 +491,191 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteRemote(file: RemoteFile) {
         if (!session.isConnected) return
         viewModelScope.launch {
-            val path = _ui.value.remotePath.trimEnd('/') + "/" + file.name
+            val path = file.fullPath(_ui.value.remotePath)
             try {
-                withTimeout(20_000) { session.deleteRemote(path) }
+                withTimeout(30_000) { session.deleteRemote(path) }
                 _ui.update { it.copy(filesBanner = "已删除 ${file.name}") }
                 refreshFiles()
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
                 if (!session.isTcpAlive()) markRemoteGone("设备已断开")
                 else _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+            }
+        }
+    }
+
+    fun createFolder(name: String) {
+        val n = name.trim()
+        if (n.isEmpty() || n.contains('/')) {
+            _ui.update { it.copy(filesBanner = "文件夹名无效") }
+            return
+        }
+        if (!session.isConnected) return
+        viewModelScope.launch {
+            val path = _ui.value.remotePath.trimEnd('/') + "/" + n
+            try {
+                withTimeout(15_000) { session.mkdirRemote(path) }
+                _ui.update { it.copy(filesBanner = "已创建 $n") }
+                refreshFiles()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+            }
+        }
+    }
+
+    fun renameRemote(file: RemoteFile, newName: String) {
+        val n = newName.trim()
+        if (n.isEmpty() || n.contains('/')) {
+            _ui.update { it.copy(filesBanner = "名称无效") }
+            return
+        }
+        if (!session.isConnected) return
+        viewModelScope.launch {
+            val from = file.fullPath(_ui.value.remotePath)
+            val to = _ui.value.remotePath.trimEnd('/') + "/" + n
+            try {
+                withTimeout(20_000) { session.renameRemote(from, to) }
+                _ui.update { it.copy(filesBanner = "已重命名为 $n") }
+                refreshFiles()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update { it.copy(filesBanner = ErrorMessages.humanize(t)) }
+            }
+        }
+    }
+
+    fun copyToClipboard(file: RemoteFile, cut: Boolean) {
+        val path = file.fullPath(_ui.value.remotePath)
+        _ui.update {
+            it.copy(
+                clipboard = FileClipboard(path, file.name, file.isDir, isCut = cut),
+                filesBanner = if (cut) "已剪切 ${file.name}" else "已复制 ${file.name}",
+            )
+        }
+    }
+
+    fun clearClipboard() {
+        _ui.update { it.copy(clipboard = null) }
+    }
+
+    fun pasteClipboard() {
+        val clip = _ui.value.clipboard ?: return
+        if (!session.isConnected) return
+        viewModelScope.launch {
+            val destDir = _ui.value.remotePath.trimEnd('/')
+            var dest = "$destDir/${clip.name}"
+            // avoid overwrite: if same path, add suffix
+            if (dest == clip.path) {
+                dest = "$destDir/copy_${clip.name}"
+            }
+            _ui.update { it.copy(transferring = true, filesBanner = "粘贴中…") }
+            try {
+                withTimeout(180_000) {
+                    if (clip.isCut) {
+                        session.moveRemote(clip.path, dest)
+                    } else {
+                        session.copyRemote(clip.path, dest)
+                    }
+                }
+                _ui.update {
+                    it.copy(
+                        transferring = false,
+                        clipboard = if (clip.isCut) null else clip,
+                        filesBanner = "已粘贴 ${clip.name}",
+                    )
+                }
+                refreshFiles()
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update {
+                    it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
+                }
+            }
+        }
+    }
+
+    fun loadProps(file: RemoteFile) {
+        if (!session.isConnected) return
+        viewModelScope.launch {
+            _ui.update { it.copy(propsLoading = true, fileProps = null) }
+            try {
+                val path = file.fullPath(_ui.value.remotePath)
+                val props = withTimeout(15_000) { session.statRemote(path) }
+                _ui.update { it.copy(propsLoading = false, fileProps = props) }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update {
+                    it.copy(
+                        propsLoading = false,
+                        fileProps = null,
+                        filesBanner = ErrorMessages.humanize(t),
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissProps() {
+        _ui.update { it.copy(fileProps = null, propsLoading = false) }
+    }
+
+    fun downloadRemote(file: RemoteFile, destUri: Uri) {
+        if (!session.isConnected || file.isDir) return
+        viewModelScope.launch {
+            _ui.update { it.copy(transferring = true, filesBanner = "下载中…") }
+            val cache = File(getApplication<Application>().cacheDir, "dl_${System.currentTimeMillis()}_${file.name}")
+            try {
+                val remote = file.fullPath(_ui.value.remotePath)
+                withTimeout(180_000) {
+                    session.pullToLocal(remote, cache) { got ->
+                        if (file.size > 0) {
+                            _ui.update {
+                                it.copy(filesBanner = "下载 ${got * 100 / file.size.coerceAtLeast(1)}%")
+                            }
+                        }
+                    }
+                }
+                getApplication<Application>().contentResolver.openOutputStream(destUri)?.use { out ->
+                    FileInputStream(cache).use { it.copyTo(out) }
+                } ?: error("无法写入保存位置")
+                _ui.update {
+                    it.copy(
+                        transferring = false,
+                        filesBanner = "已保存到手机",
+                        lastDownloadedLocalPath = destUri.toString(),
+                    )
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update {
+                    it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
+                }
+            } finally {
+                cache.delete()
+            }
+        }
+    }
+
+    fun installRemoteApk(file: RemoteFile) {
+        if (!session.isConnected || file.isDir) return
+        if (!file.name.endsWith(".apk", ignoreCase = true)) {
+            _ui.update { it.copy(filesBanner = "只能安装 .apk 文件") }
+            return
+        }
+        viewModelScope.launch {
+            _ui.update { it.copy(transferring = true, filesBanner = "正在安装 ${file.name}…") }
+            try {
+                val remote = file.fullPath(_ui.value.remotePath)
+                withTimeout(120_000) { session.installRemoteApk(remote) }
+                _ui.update {
+                    it.copy(transferring = false, filesBanner = "安装成功：${file.name}")
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _ui.update {
+                    it.copy(transferring = false, filesBanner = ErrorMessages.humanize(t))
+                }
             }
         }
     }

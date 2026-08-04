@@ -26,6 +26,31 @@ data class RemoteFile(
     val name: String,
     val isDir: Boolean,
     val size: Long = 0L,
+    /** Unix epoch seconds, 0 if unknown */
+    val mtimeSec: Long = 0L,
+    /** e.g. -rw-rw---- or ? */
+    val permissions: String = "?",
+    val isLink: Boolean = false,
+) {
+    fun fullPath(parent: String): String {
+        val base = parent.trimEnd('/')
+        return if (base.isEmpty() || base == "/") "/$name" else "$base/$name"
+    }
+}
+
+data class RemoteFileProps(
+    val path: String,
+    val name: String,
+    val isDir: Boolean,
+    val isLink: Boolean,
+    val size: Long,
+    val mtimeSec: Long,
+    val permissions: String,
+    val owner: String,
+    val typeLabel: String,
+    val readable: Boolean,
+    val writable: Boolean,
+    val linkTarget: String? = null,
 )
 
 /**
@@ -187,31 +212,51 @@ class TvSession(private val appContext: Context) {
     suspend fun listDir(path: String): List<RemoteFile> = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
-            val p = path.trim().ifEmpty { "/sdcard" }
-            // one line per entry: D|name or F|size|name
-            val script =
-                "ls -1A \"$p\" 2>/dev/null | while IFS= read -r n; do " +
-                    "if [ -d \"$p/\$n\" ]; then echo \"D|\$n\"; " +
-                    "elif [ -f \"$p/\$n\" ]; then sz=\$(wc -c < \"$p/\$n\" 2>/dev/null || echo 0); echo \"F|\$sz|\$n\"; " +
-                    "fi; done"
-            val out = shell(script, 20_000)
+            val p = path.trim().ifEmpty { "/sdcard" }.trimEnd('/').ifEmpty { "/" }
+            // TYPE \t SIZE \t MTIME \t PERM \t NAME
+            val script = """
+                p="$p"
+                ls -1A "${'$'}p" 2>/dev/null | while IFS= read -r n; do
+                  [ -z "${'$'}n" ] && continue
+                  f="${'$'}p/${'$'}n"
+                  if [ -d "${'$'}f" ]; then t=D
+                  elif [ -L "${'$'}f" ]; then t=L
+                  elif [ -f "${'$'}f" ]; then t=F
+                  else t=O
+                  fi
+                  sz=${'$'}(stat -c %s "${'$'}f" 2>/dev/null || wc -c < "${'$'}f" 2>/dev/null || echo 0)
+                  mt=${'$'}(stat -c %Y "${'$'}f" 2>/dev/null || echo 0)
+                  pm=${'$'}(stat -c %A "${'$'}f" 2>/dev/null || echo '?')
+                  sz=${'$'}(echo "${'$'}sz" | tr -d '[:space:]')
+                  mt=${'$'}(echo "${'$'}mt" | tr -d '[:space:]')
+                  printf '%s\t%s\t%s\t%s\t%s\n' "${'$'}t" "${'$'}sz" "${'$'}mt" "${'$'}pm" "${'$'}n"
+                done
+            """.trimIndent()
+            val out = shell(script, 25_000)
             out.lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
+                .map { it.trimEnd('\r') }
+                .filter { it.isNotEmpty() && '\t' in it }
                 .mapNotNull { line ->
-                    when {
-                        line.startsWith("D|") -> RemoteFile(line.removePrefix("D|"), isDir = true)
-                        line.startsWith("F|") -> {
-                            val rest = line.removePrefix("F|")
-                            val bar = rest.indexOf('|')
-                            if (bar <= 0) null
-                            else {
-                                val sz = rest.substring(0, bar).trim().toLongOrNull() ?: 0L
-                                val name = rest.substring(bar + 1)
-                                RemoteFile(name, isDir = false, size = sz)
-                            }
-                        }
-                        else -> null
+                    val parts = line.split('\t', limit = 5)
+                    if (parts.size < 5) return@mapNotNull null
+                    val type = parts[0]
+                    val size = parts[1].toLongOrNull() ?: 0L
+                    val mtime = parts[2].toLongOrNull() ?: 0L
+                    val perm = parts[3].ifBlank { "?" }
+                    val name = parts[4]
+                    if (name.isBlank() || name == "." || name == "..") return@mapNotNull null
+                    RemoteFile(
+                        name = name,
+                        isDir = type == "D" || (type == "L" && false), // links: treat file unless -d below
+                        size = size,
+                        mtimeSec = mtime,
+                        permissions = perm,
+                        isLink = type == "L",
+                    ).let { f ->
+                        // directory symlink: type L but we want open as dir if target is dir — re-check via type D first
+                        if (type == "D") f.copy(isDir = true)
+                        else if (type == "L") f.copy(isDir = false) // open as file/link; user can still navigate if needed
+                        else f.copy(isDir = false)
                     }
                 }
                 .sortedWith(compareBy({ !it.isDir }, { it.name.lowercase() }))
@@ -219,13 +264,65 @@ class TvSession(private val appContext: Context) {
         }
     }
 
+    suspend fun statRemote(path: String): RemoteFileProps = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            checkLinked()
+            val p = path.trim()
+            val script = """
+                f="$p"
+                if [ ! -e "${'$'}f" ]; then echo 'MISSING'; exit 0; fi
+                if [ -L "${'$'}f" ]; then t=link
+                elif [ -d "${'$'}f" ]; then t=dir
+                elif [ -f "${'$'}f" ]; then t=file
+                else t=other
+                fi
+                sz=${'$'}(stat -c %s "${'$'}f" 2>/dev/null || wc -c < "${'$'}f" 2>/dev/null || echo 0)
+                mt=${'$'}(stat -c %Y "${'$'}f" 2>/dev/null || echo 0)
+                pm=${'$'}(stat -c %A "${'$'}f" 2>/dev/null || echo '?')
+                ow=${'$'}(stat -c %U:%G "${'$'}f" 2>/dev/null || echo '?')
+                lt=""
+                if [ -L "${'$'}f" ]; then lt=${'$'}(readlink "${'$'}f" 2>/dev/null || true); fi
+                r=0; w=0
+                [ -r "${'$'}f" ] && r=1
+                [ -w "${'$'}f" ] && w=1
+                nm=${'$'}(basename "${'$'}f")
+                printf 'OK\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+                  "${'$'}t" "${'$'}sz" "${'$'}mt" "${'$'}pm" "${'$'}ow" "${'$'}r" "${'$'}w" "${'$'}nm" "${'$'}lt"
+            """.trimIndent()
+            val out = shell(script, 15_000).lines().map { it.trimEnd('\r') }
+            if (out.firstOrNull() == "MISSING" || out.firstOrNull() != "OK") {
+                error("文件不存在或无法访问")
+            }
+            fun line(i: Int) = out.getOrNull(i + 1).orEmpty()
+            val type = line(0)
+            RemoteFileProps(
+                path = p,
+                name = line(7).ifBlank { p.substringAfterLast('/') },
+                isDir = type == "dir",
+                isLink = type == "link",
+                size = line(1).toLongOrNull() ?: 0L,
+                mtimeSec = line(2).toLongOrNull() ?: 0L,
+                permissions = line(3).ifBlank { "?" },
+                owner = line(4).ifBlank { "?" },
+                typeLabel = when (type) {
+                    "dir" -> "文件夹"
+                    "link" -> "链接"
+                    "file" -> "文件"
+                    else -> "其他"
+                },
+                readable = line(5) == "1",
+                writable = line(6) == "1",
+                linkTarget = line(8).takeIf { it.isNotBlank() },
+            )
+        }
+    }
+
     suspend fun deleteRemote(path: String) = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
-            val out = shell("rm -rf \"$path\" 2>&1; echo EXIT:\$?", 15_000)
-            if (out.contains("EXIT:0")) return@withLock
-            if (out.contains("No such") || out.contains("Permission")) {
-                error(out)
+            val out = shell("rm -rf \"$path\" 2>&1; echo EXIT:\$?", 20_000)
+            if (!out.contains("EXIT:0")) {
+                error(out.replace("EXIT:", "").ifBlank { "删除失败" })
             }
         }
     }
@@ -233,7 +330,84 @@ class TvSession(private val appContext: Context) {
     suspend fun mkdirRemote(path: String) = withContext(Dispatchers.IO) {
         mutex.withLock {
             checkLinked()
-            shell("mkdir -p \"$path\"", 10_000)
+            val out = shell("mkdir -p \"$path\" 2>&1; echo EXIT:\$?", 10_000)
+            if (!out.contains("EXIT:0")) error(out.ifBlank { "创建文件夹失败" })
+        }
+    }
+
+    suspend fun renameRemote(fromPath: String, toPath: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            checkLinked()
+            val out = shell("mv -n \"$fromPath\" \"$toPath\" 2>&1; echo EXIT:\$?", 15_000)
+            if (!out.contains("EXIT:0")) error(out.ifBlank { "重命名失败" })
+        }
+    }
+
+    suspend fun copyRemote(fromPath: String, toPath: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            checkLinked()
+            val out = shell("cp -a \"$fromPath\" \"$toPath\" 2>&1; echo EXIT:\$?", 120_000)
+            if (!out.contains("EXIT:0")) error(out.ifBlank { "复制失败" })
+        }
+    }
+
+    suspend fun moveRemote(fromPath: String, toPath: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            checkLinked()
+            val out = shell("mv \"$fromPath\" \"$toPath\" 2>&1; echo EXIT:\$?", 60_000)
+            if (!out.contains("EXIT:0")) error(out.ifBlank { "移动失败" })
+        }
+    }
+
+    suspend fun pullToLocal(
+        remotePath: String,
+        localFile: File,
+        onProgress: (Long) -> Unit = {},
+    ) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            checkLinked()
+            localFile.parentFile?.mkdirs()
+            if (localFile.exists()) localFile.delete()
+            val stream = callTimed(15_000) {
+                manager.openStream("exec:cat \"$remotePath\"")
+            }
+            try {
+                callTimed(180_000) {
+                    FileOutputStream(localFile).use { fos ->
+                        val input = stream.openInputStream()
+                        val buf = ByteArray(64 * 1024)
+                        var got = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            if (n == 0) continue
+                            fos.write(buf, 0, n)
+                            got += n
+                            if (got % (256 * 1024) < 64 * 1024) onProgress(got)
+                        }
+                        fos.flush()
+                    }
+                }
+            } finally {
+                try {
+                    callTimed(10_000) { stream.close() }
+                } catch (_: Exception) {
+                }
+            }
+            if (!localFile.exists() || localFile.length() <= 0L) {
+                // empty file might be valid; only error if missing
+                if (!localFile.exists()) error("下载失败：未写入本地文件")
+            }
+        }
+    }
+
+    suspend fun installRemoteApk(remotePath: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            checkLinked()
+            val result = shell("pm install -r -t \"$remotePath\"", 90_000)
+            if (!result.contains("Success", ignoreCase = true)) {
+                error(result.ifBlank { "安装失败" })
+            }
         }
     }
 
