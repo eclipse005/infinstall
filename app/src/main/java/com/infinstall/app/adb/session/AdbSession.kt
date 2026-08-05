@@ -43,9 +43,9 @@ class AdbSession private constructor(context: Context) {
         isSessionLive = { _state.value is SessionState.Connected },
         onTransportDead = { reason ->
             Log.w(TAG, "transport dead: $reason")
-            // Best-effort teardown without re-entering lifecycleLock from I/O thread
+            // Use manager directly — do not touch `transport` during its own init/callback
             try {
-                transport.managerDisconnect()
+                manager.disconnect()
             } catch (_: Exception) {
             }
             _state.value = SessionState.Disconnected
