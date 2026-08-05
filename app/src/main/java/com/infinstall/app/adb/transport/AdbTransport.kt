@@ -21,21 +21,21 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Single serial ADB channel.
  *
- * ## Design (source-level, not workarounds)
+ * ## Design (source-level)
  *
- * 1. **OPEN destinations are only short ASCII service names**:
- *    - `shell:` — interactive shell; commands written to the stream
- *    - `sync:`  — file sync protocol
- *    Never put command text / paths into OPEN (libadb 3.1.1 still under-allocates
- *    OPEN buffers for long/UTF-8 destinations; also matches clean service model).
+ * 1. **OPEN destinations** — short ASCII only:
+ *    - `shell:` / `sync:` (interactive shell body / sync protocol)
+ *    - short pure-ASCII `shell:<cmd>` for one-shot (matches host `adb shell cmd`)
+ *    Long/UTF-8 destinations stay out of OPEN (libadb buffer limit).
  *
- * 2. **One mutex** — all user-visible ops serialize.
+ * 2. **One mutex** — all ops on this connection serialize (one adbd client).
  *
- * 3. **Timeout always closes the active [AdbStream]** then cancels the worker,
- *    so half-open streams do not poison the session.
+ * 3. **Timeout** closes the active [AdbStream] then cancels the worker
+ *    (stream death ≠ session death).
  *
- * 4. **Session lifetime is not owned here** — only [onTransportDead] for proven
- *    connection-level death.
+ * 4. **Session lifetime is not owned here.** This layer only reports
+ *    [LinkHealth]: whether the **existing** ADB link is still a live transport.
+ *    It never opens a second TCP connection to the device port.
  */
 class AdbTransport(
     private val manager: InfinstallAdbManager,
@@ -59,47 +59,64 @@ class AdbTransport(
 
     suspend fun <T> withSerial(block: () -> T): T = mutex.withLock { block() }
 
-    enum class LightPing {
-        /** Mutex busy — real op in progress; treat as alive */
+    /**
+     * Result of observing the **existing** ADB link (no second TCP connect).
+     *
+     * Maps cleanly to session policy:
+     * - [Ok] / [Busy] / [Transient] → stay Connected
+     * - [Dead] → leave Connected (only proven transport death)
+     */
+    enum class LinkHealth {
+        /** Lightest ADB op succeeded on this session */
+        Ok,
+        /** Another op holds the bus — link is in active use */
         Busy,
-        /** Probe succeeded */
-        Alive,
-        /** Soft failure (retry streak) */
-        Fail,
-        /** Connection-level death */
+        /** Op failed but does not prove the TCP/TLS session is gone */
+        Transient,
+        /** Connection-level death: reset / not connected / manager down */
         Dead,
     }
 
     /**
-     * Non-blocking keepalive probe on the **existing** ADB session only.
-     * Skips if another op holds the mutex. Must not hold [mutex] already.
+     * Observe link health on the existing session.
+     * Must not be called while already holding [mutex].
+     *
+     * Never opens a new host:port TCP connection (single-client adbd safe).
      */
-    fun tryLightPing(): LightPing {
+    fun observeLink(): LinkHealth {
+        if (!manager.isConnected) {
+            Log.w(TAG, "observeLink: manager not connected")
+            return LinkHealth.Dead
+        }
         if (!mutex.tryLock()) {
-            return if (!manager.isConnected) LightPing.Dead else LightPing.Busy
+            return LinkHealth.Busy
         }
         return try {
-            if (!isSessionLive()) return LightPing.Dead
-            if (!manager.isConnected) {
-                Log.w(TAG, "lightPing: manager reports not connected")
-                return LightPing.Dead
-            }
-            // One-shot OPEN — same style as host `adb shell echo …`
-            val out = shellOneShotAscii("echo __PING_OK__", PING_TIMEOUT_MS)
+            if (!isSessionLive()) return LinkHealth.Dead
+            if (!manager.isConnected) return LinkHealth.Dead
+            // Lightest protocol touch: same as host `adb shell echo …`
+            val out = shellOneShotAscii("echo __PING_OK__", LINK_OBSERVE_TIMEOUT_MS)
             if (out.contains("__PING_OK__")) {
-                LightPing.Alive
+                LinkHealth.Ok
             } else {
-                Log.w(TAG, "lightPing soft-miss out=${out.take(80)}")
-                LightPing.Fail
+                // Empty/garbled output: stream issue, not proof the link is dead
+                Log.w(TAG, "observeLink transient soft-miss out=${out.take(80)}")
+                LinkHealth.Transient
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "lightPing: ${t.javaClass.simpleName} ${t.message}")
-            // Only clear transport death → Dead; timeouts / flaky streams → Fail (streak)
-            if (!manager.isConnected || isConnectionDead(t)) LightPing.Dead else LightPing.Fail
+            Log.w(TAG, "observeLink: ${t.javaClass.simpleName} ${t.message}")
+            if (!manager.isConnected || isConnectionDead(t)) {
+                LinkHealth.Dead
+            } else {
+                LinkHealth.Transient
+            }
         } finally {
             mutex.unlock()
         }
     }
+
+    /** Manager still believes the ADB connection is up (no I/O). */
+    fun managerReportsConnected(): Boolean = manager.isConnected
 
     // ── shell ──────────────────────────────────────────────
 
@@ -326,17 +343,54 @@ class AdbTransport(
         }
     }
 
+    /**
+     * True only when the **ADB connection** (TCP/TLS to adbd) is gone —
+     * not when a single stream glitches.
+     *
+     * This is the sole classifier for [LinkHealth.Dead] / [onTransportDead].
+     */
     private fun isConnectionDead(t: Throwable): Boolean {
-        val m = (t.message ?: "").lowercase()
         if (t is java.nio.BufferOverflowException) return false
-        if ("stream closed" in m) return false
-        if (t is java.io.EOFException) return false
-        return "connection reset" in m ||
-            "broken pipe" in m ||
-            "not connected" in m ||
-            "failed to connect" in m ||
-            "socket closed" in m ||
-            (t is java.net.SocketException && "reset" in m)
+        // Walk cause chain (libadb often wraps the socket/SSL error)
+        val chain = generateSequence(t) { it.cause }.toList()
+        val msg = chain.joinToString(" ") {
+            listOfNotNull(it.javaClass.simpleName, it.message).joinToString(" ")
+        }.lowercase()
+
+        // Single-stream / protocol noise — session stays up
+        if ("stream closed" in msg &&
+            "connection reset" !in msg &&
+            "broken pipe" !in msg &&
+            "not connected" !in msg
+        ) {
+            return false
+        }
+        if (chain.any { it is java.io.EOFException } &&
+            "connection reset" !in msg &&
+            "broken pipe" !in msg
+        ) {
+            return false
+        }
+
+        return "connection reset" in msg ||
+            "broken pipe" in msg ||
+            "not connected" in msg ||
+            "failed to connect" in msg ||
+            "socket closed" in msg ||
+            "connection abort" in msg ||
+            "software caused connection abort" in msg ||
+            "connection refused" in msg ||
+            chain.any { it is java.net.SocketException } ||
+            chain.any {
+                it is javax.net.ssl.SSLException && (
+                    "reset" in (it.message ?: "").lowercase() ||
+                        "abort" in (it.message ?: "").lowercase() ||
+                        "closed" in (it.message ?: "").lowercase() ||
+                        "connection" in (it.message ?: "").lowercase() ||
+                        "read error" in (it.message ?: "").lowercase() ||
+                        "write error" in (it.message ?: "").lowercase()
+                    )
+            }
     }
 
     private fun mapIo(t: Throwable): Throwable {
@@ -410,8 +464,8 @@ class AdbTransport(
         private const val SERVICE_SHELL = "shell:"
         private const val SERVICE_SYNC = "sync:"
         private const val MAX_SHELL_OUT = 4 * 1024 * 1024
-        /** Allow slow TV shells; soft fails still need a streak to drop. */
-        private const val PING_TIMEOUT_MS = 6_000L
+        /** Timeout for idle link observation only (op timeout ≠ session death). */
+        private const val LINK_OBSERVE_TIMEOUT_MS = 8_000L
 
         /** Only these temp names are used for pm install (ASCII, no spaces/quotes). */
         val SAFE_TMP_APK: Regex = Regex("""^/data/local/tmp/ii\d+\.apk$""")

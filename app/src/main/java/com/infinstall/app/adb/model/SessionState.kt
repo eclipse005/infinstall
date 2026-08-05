@@ -3,8 +3,9 @@ package com.infinstall.app.adb.model
 /**
  * Connection lifecycle. Only [com.infinstall.app.adb.session.AdbSession] may transition this.
  *
- * Principle: Connected stays Connected while the remote adbd accepts our session.
- * Timeouts, permission errors, empty listings — none of these change state.
+ * Sticky: stay [Connected] while the ADB link to adbd is alive.
+ * Timeouts, stream glitches, permission errors, empty listings — do **not** leave Connected.
+ * Leave only: user disconnect, connect failure, or proven link death.
  */
 sealed class SessionState {
     data object Disconnected : SessionState()

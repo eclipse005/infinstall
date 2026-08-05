@@ -25,17 +25,28 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Sole owner of connection lifecycle + ADB operations.
  *
- * Leave Connected only via:
- * - user [disconnect]
- * - failed [connect]
- * - proven transport death
- * - keepalive: consecutive ADB echo failures (no extra TCP probes —
- *   many adbd only accept one client; a second connect falsely looks "dead")
+ * ## Session lifetime (sticky, aligned with host adb semantics)
+ *
+ * Leave [SessionState.Connected] **only** when:
+ * 1. User calls [disconnect]
+ * 2. [connect] fails
+ * 3. Transport proves the **link is dead** (reset / broken pipe / manager not connected)
+ *
+ * Do **not** leave Connected because of:
+ * - single op timeout, Stream closed, permission error, empty listing
+ * - soft/garbled probe output
+ * - a second TCP connect to host:port (forbidden: single-client adbd)
+ *
+ * ## Idle link observation
+ *
+ * While Connected, a background loop occasionally touches the **existing**
+ * session (same serial bus as real ops). Its only job is to surface
+ * link death when the user is idle (e.g. peer turned off wireless debugging).
+ * [AdbTransport.LinkHealth.Transient] never changes session state.
  */
 class AdbSession private constructor(context: Context) {
     private val app = context.applicationContext
@@ -48,7 +59,7 @@ class AdbSession private constructor(context: Context) {
 
     /**
      * Human-readable reason when session drops without user tapping disconnect.
-     * Cleared on next successful connect.
+     * Cleared on next successful connect / user disconnect.
      */
     @Volatile
     var lastDropReason: String? = null
@@ -58,18 +69,14 @@ class AdbSession private constructor(context: Context) {
     val host: String? get() = (_state.value as? SessionState.Connected)?.host
     val port: Int? get() = (_state.value as? SessionState.Connected)?.port
 
-    private var keepAliveJob: Job? = null
-    private val probeFailStreak = AtomicInteger(0)
+    private var linkWatchJob: Job? = null
 
     private val transport = AdbTransport(
         manager = manager,
         isSessionLive = { _state.value is SessionState.Connected },
-        onTransportDead = { reason ->
-            Log.w(TAG, "transport dead: $reason")
-            dropToDisconnected(
-                reason = "设备端调试已关闭或网络中断",
-                fromTransport = true,
-            )
+        onTransportDead = { detail ->
+            Log.w(TAG, "transport proved dead during op: $detail")
+            dropBecauseLinkDead(fromTransportCallback = true)
         },
     )
 
@@ -78,7 +85,7 @@ class AdbSession private constructor(context: Context) {
 
     suspend fun pair(host: String, pairPort: Int, code: String) = withContext(Dispatchers.IO) {
         lifecycleLock.withLock {
-            stopKeepAlive()
+            stopLinkWatch()
             val h = host.trim()
             val c = code.filter { it.isDigit() }
             if (c.length !in 5..8) throw AdbException("配对码应为 6 位数字")
@@ -97,7 +104,7 @@ class AdbSession private constructor(context: Context) {
 
     suspend fun connect(host: String, port: Int) = withContext(Dispatchers.IO) {
         lifecycleLock.withLock {
-            stopKeepAlive()
+            stopLinkWatch()
             lastDropReason = null
             val h = host.trim()
             if (port !in 1..65535) throw AdbException("端口无效：$port")
@@ -105,21 +112,28 @@ class AdbSession private constructor(context: Context) {
             _state.value = SessionState.Connecting(h, port)
             try {
                 transport.managerConnect(h, port)
+                // Prove the session can run a command before advertising Connected
+                val probe = transport.withSerial {
+                    transport.shell("echo infinstall_ok", 12_000)
+                }
+                if (!probe.contains("infinstall_ok")) {
+                    // Soft miss at connect: still treat as up if manager connected;
+                    // sticky policy — do not fail connect on soft shell noise alone
+                    // unless manager already dead.
+                    if (!transport.managerReportsConnected()) {
+                        error("握手后链路不可用")
+                    }
+                    Log.w(TAG, "connect probe soft-miss: ${probe.take(80)}")
+                }
                 _state.value = SessionState.Connected(
                     host = h,
                     port = port,
                     sinceMs = SystemClock.elapsedRealtime(),
                 )
-                val probe = transport.withSerial {
-                    transport.shell("echo infinstall_ok", 12_000)
-                }
-                if (!probe.contains("infinstall_ok")) {
-                    Log.w(TAG, "probe soft-miss: ${probe.take(80)}")
-                }
                 Log.i(TAG, "connected $h:$port")
-                startKeepAlive()
+                startLinkWatch()
             } catch (t: Throwable) {
-                stopKeepAlive()
+                stopLinkWatch()
                 transport.managerDisconnect()
                 _state.value = SessionState.Disconnected
                 throw mapConnect(t, h, port, pairing = false)
@@ -129,7 +143,7 @@ class AdbSession private constructor(context: Context) {
 
     suspend fun disconnect() = withContext(Dispatchers.IO) {
         lifecycleLock.withLock {
-            stopKeepAlive()
+            stopLinkWatch()
             lastDropReason = null
             transport.managerDisconnect()
             _state.value = SessionState.Disconnected
@@ -138,105 +152,67 @@ class AdbSession private constructor(context: Context) {
     }
 
     /**
-     * Heartbeat while Connected (background coroutine).
+     * Idle link watch: periodically observe the existing ADB link.
      *
-     * Only probes over the **existing** ADB session (`shell:echo`).
-     * Do **not** open a second TCP connection to host:port — many TV/box adbd
-     * allow only one client; that "port probe" was causing false disconnects.
+     * Policy (source rule, not thresholds-as-patches):
+     * - [LinkHealth.Dead] → leave Connected once
+     * - Ok / Busy / Transient → stay Connected
      *
-     * Drop when:
-     * - ADB reports clear peer death
-     * - [KEEPALIVE_FAIL_THRESHOLD] consecutive soft fails while idle
-     * - no healthy tick for [KEEPALIVE_STALE_MS] (half-open / hung)
+     * No fail counters, no “stale force drop”, no second TCP to host:port.
      */
-    private fun startKeepAlive() {
-        stopKeepAlive()
-        probeFailStreak.set(0)
-        var lastOkAt = SystemClock.elapsedRealtime()
-        keepAliveJob = scope.launch {
-            Log.i(
-                TAG,
-                "heartbeat start interval=${KEEPALIVE_INTERVAL_MS}ms " +
-                    "failNeed=$KEEPALIVE_FAIL_THRESHOLD staleMs=$KEEPALIVE_STALE_MS",
-            )
+    private fun startLinkWatch() {
+        stopLinkWatch()
+        linkWatchJob = scope.launch {
+            Log.i(TAG, "link-watch start every ${LINK_WATCH_INTERVAL_MS}ms (drop only on proven death)")
             while (isActive) {
-                delay(KEEPALIVE_INTERVAL_MS)
+                delay(LINK_WATCH_INTERVAL_MS)
                 if (_state.value !is SessionState.Connected) break
 
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastOkAt >= KEEPALIVE_STALE_MS) {
-                    Log.w(TAG, "heartbeat stale: no ok tick for ${now - lastOkAt}ms")
-                    dropToDisconnected(
-                        reason = "设备端调试已关闭或网络中断，请重新连接",
-                        fromTransport = false,
-                    )
+                // Cheap flag from libadb — no I/O
+                if (!transport.managerReportsConnected()) {
+                    Log.w(TAG, "link-watch: manager reports not connected")
+                    dropBecauseLinkDead(fromTransportCallback = false)
                     break
                 }
 
-                when (val r = transport.tryLightPing()) {
-                    AdbTransport.LightPing.Busy -> {
-                        // Real install/push holds the bus — connection is in use
-                        probeFailStreak.set(0)
-                        lastOkAt = SystemClock.elapsedRealtime()
-                        Log.d(TAG, "heartbeat ok (busy)")
+                when (val health = transport.observeLink()) {
+                    AdbTransport.LinkHealth.Ok,
+                    AdbTransport.LinkHealth.Busy,
+                    -> {
+                        Log.d(TAG, "link-watch $health")
                     }
-                    AdbTransport.LightPing.Alive -> {
-                        probeFailStreak.set(0)
-                        lastOkAt = SystemClock.elapsedRealtime()
-                        Log.d(TAG, "heartbeat ok")
+                    AdbTransport.LinkHealth.Transient -> {
+                        // Op glitch / timeout / soft-miss — stay Connected (sticky)
+                        Log.w(TAG, "link-watch transient (session stays connected)")
                     }
-                    AdbTransport.LightPing.Fail -> {
-                        val n = probeFailStreak.incrementAndGet()
-                        Log.w(TAG, "heartbeat soft-fail streak=$n")
-                        if (n >= KEEPALIVE_FAIL_THRESHOLD) {
-                            dropToDisconnected(
-                                reason = "设备端调试已关闭或网络中断，请重新连接",
-                                fromTransport = false,
-                            )
-                            break
-                        }
-                    }
-                    AdbTransport.LightPing.Dead -> {
-                        dropToDisconnected(
-                            reason = "设备端调试已关闭或网络中断，请重新连接",
-                            fromTransport = true,
-                        )
+                    AdbTransport.LinkHealth.Dead -> {
+                        Log.w(TAG, "link-watch proven dead")
+                        dropBecauseLinkDead(fromTransportCallback = false)
                         break
                     }
                 }
             }
-            Log.i(TAG, "heartbeat loop end")
+            Log.i(TAG, "link-watch end")
         }
     }
 
-    private fun stopKeepAlive() {
-        keepAliveJob?.cancel()
-        keepAliveJob = null
-        probeFailStreak.set(0)
+    private fun stopLinkWatch() {
+        linkWatchJob?.cancel()
+        linkWatchJob = null
     }
 
-    private fun dropToDisconnected(reason: String, fromTransport: Boolean) {
-        stopKeepAlive()
-        lastDropReason = reason
-        if (!fromTransport) {
-            try {
-                manager.disconnect()
-            } catch (_: Exception) {
-            }
-        } else {
-            // transport callback already disconnects manager in some paths;
-            // still ensure clean
-            try {
-                manager.disconnect()
-            } catch (_: Exception) {
-            }
+    private fun dropBecauseLinkDead(fromTransportCallback: Boolean) {
+        stopLinkWatch()
+        lastDropReason = DROP_REASON_LINK_DEAD
+        try {
+            manager.disconnect()
+        } catch (_: Exception) {
         }
-        if (_state.value is SessionState.Connected ||
-            _state.value is SessionState.Connecting
-        ) {
+        val cur = _state.value
+        if (cur is SessionState.Connected || cur is SessionState.Connecting) {
             _state.value = SessionState.Disconnected
         }
-        Log.w(TAG, "session dropped: $reason")
+        Log.w(TAG, "session dropped (link dead) fromTransport=$fromTransportCallback")
     }
 
     suspend fun shell(command: String, timeoutMs: Long = 15_000): String =
@@ -335,12 +311,10 @@ class AdbSession private constructor(context: Context) {
 
     companion object {
         private const val TAG = "AdbSession"
-        /** Heartbeat period while Connected */
-        private const val KEEPALIVE_INTERVAL_MS = 8_000L
-        /** Consecutive soft ADB fails before drop (avoid flaky single miss) */
-        private const val KEEPALIVE_FAIL_THRESHOLD = 3
-        /** No healthy tick within this window → force drop */
-        private const val KEEPALIVE_STALE_MS = 60_000L
+        /** How often to observe the existing link while idle (I/O only if bus free). */
+        private const val LINK_WATCH_INTERVAL_MS = 15_000L
+        private const val DROP_REASON_LINK_DEAD =
+            "设备端调试已关闭或网络中断，请重新连接"
 
         @Volatile
         private var instance: AdbSession? = null
