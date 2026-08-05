@@ -139,25 +139,47 @@ class AdbSession private constructor(context: Context) {
     /**
      * Light keepalive:
      * - Every [KEEPALIVE_INTERVAL_MS] while Connected
-     * - Skip when transport is busy (real op holds mutex) → treat as alive
-     * - Tiny shell probe; need [KEEPALIVE_FAIL_THRESHOLD] consecutive fails to drop
+     * - Busy (real op holds bus): skip tick only — do **not** treat as proof of life
+     * - One-shot shell probe; [KEEPALIVE_FAIL_THRESHOLD] consecutive Fail → drop
+     * - Dead (peer gone / manager down) → drop immediately
+     * - Stale watchdog: no confirmed Alive for [KEEPALIVE_STALE_MS] → drop
+     *   (covers half-open TCP / hung bus after remote ADB is toggled off)
      */
     private fun startKeepAlive() {
         stopKeepAlive()
         probeFailStreak.set(0)
+        val connectedAt = SystemClock.elapsedRealtime()
+        var lastAliveAt = connectedAt
         keepAliveJob = scope.launch {
-            Log.i(TAG, "keepalive start interval=${KEEPALIVE_INTERVAL_MS}ms failNeed=$KEEPALIVE_FAIL_THRESHOLD")
+            Log.i(
+                TAG,
+                "keepalive start interval=${KEEPALIVE_INTERVAL_MS}ms " +
+                    "failNeed=$KEEPALIVE_FAIL_THRESHOLD staleMs=$KEEPALIVE_STALE_MS",
+            )
             while (isActive) {
                 delay(KEEPALIVE_INTERVAL_MS)
                 if (_state.value !is SessionState.Connected) break
 
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastAliveAt >= KEEPALIVE_STALE_MS) {
+                    Log.w(TAG, "keepalive stale: no Alive for ${now - lastAliveAt}ms")
+                    dropToDisconnected(
+                        reason = "设备端调试已关闭或网络中断，请重新连接",
+                        fromTransport = false,
+                    )
+                    break
+                }
+
                 when (val r = transport.tryLightPing()) {
                     AdbTransport.LightPing.Busy -> {
-                        // Real work in progress — connection is usable
-                        probeFailStreak.set(0)
+                        // Long install/push holds the bus — refresh stale clock only.
+                        // Do NOT clear fail streak (Busy is not a proof of peer liveness).
+                        lastAliveAt = SystemClock.elapsedRealtime()
+                        Log.d(TAG, "keepalive busy (skip probe)")
                     }
                     AdbTransport.LightPing.Alive -> {
                         probeFailStreak.set(0)
+                        lastAliveAt = SystemClock.elapsedRealtime()
                     }
                     AdbTransport.LightPing.Fail -> {
                         val n = probeFailStreak.incrementAndGet()
@@ -308,10 +330,15 @@ class AdbSession private constructor(context: Context) {
 
     companion object {
         private const val TAG = "AdbSession"
-        /** Idle probe interval */
-        private const val KEEPALIVE_INTERVAL_MS = 12_000L
-        /** Need this many consecutive probe failures while idle to drop session */
+        /** Idle probe interval — keep short so remote ADB off is noticed quickly */
+        private const val KEEPALIVE_INTERVAL_MS = 5_000L
+        /** Consecutive soft probe failures while idle before drop */
         private const val KEEPALIVE_FAIL_THRESHOLD = 2
+        /**
+         * No confirmed Alive within this window → force drop.
+         * Covers half-open sockets and perpetual Busy after peer dies mid-op.
+         */
+        private const val KEEPALIVE_STALE_MS = 25_000L
 
         @Volatile
         private var instance: AdbSession? = null
