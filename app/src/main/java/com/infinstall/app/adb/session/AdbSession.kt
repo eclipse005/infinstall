@@ -119,7 +119,7 @@ class AdbSession private constructor(context: Context) {
         lifecycleLock.withLock {
             stopLinkWatch()
             lastDropReason = null
-            clearStagedRemote(bestEffortRm = false)
+            stagedApk = null
             val h = host.trim()
             if (port !in 1..65535) throw AdbException("端口无效：$port")
             transport.managerDisconnect()
@@ -166,7 +166,7 @@ class AdbSession private constructor(context: Context) {
         lifecycleLock.withLock {
             stopLinkWatch()
             lastDropReason = null
-            clearStagedRemote(bestEffortRm = false) // link is about to go; skip remote rm
+            stagedApk = null // about to drop link; remote tmp is gone with adbd session
             transport.managerDisconnect()
             _state.value = SessionState.Disconnected
             Log.i(TAG, "disconnected by user")
@@ -226,7 +226,7 @@ class AdbSession private constructor(context: Context) {
     private fun dropBecauseLinkDead(fromTransportCallback: Boolean) {
         stopLinkWatch()
         lastDropReason = DROP_REASON_LINK_DEAD
-        clearStagedRemote(bestEffortRm = false)
+        stagedApk = null
         try {
             manager.disconnect()
         } catch (_: Exception) {
@@ -236,18 +236,6 @@ class AdbSession private constructor(context: Context) {
             _state.value = SessionState.Disconnected
         }
         Log.w(TAG, "session dropped (link dead) fromTransport=$fromTransportCallback")
-    }
-
-    private fun clearStagedRemote(bestEffortRm: Boolean) {
-        val s = stagedApk
-        stagedApk = null
-        if (bestEffortRm && s != null) {
-            runCatching {
-                transport.withSerial {
-                    transport.shell("rm -f ${transport.q(s.remotePath)}", 8_000)
-                }
-            }
-        }
     }
 
     suspend fun shell(command: String, timeoutMs: Long = 15_000): String =
