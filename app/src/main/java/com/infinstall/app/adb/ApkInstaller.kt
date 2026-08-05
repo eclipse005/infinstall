@@ -10,16 +10,16 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 /**
- * **唯一**官方安装路径（与文档中 `adb install` 分解步骤一致）:
+ * Single official install recipe (same decomposition as host `adb install`):
  *
  * ```
- * adb push app.apk /data/local/tmp/….apk   →  sync SEND
- * adb shell pm install -r -t -g …         →  shell:pm install
- * adb shell rm /data/local/tmp/….apk      →  shell:rm
+ * adb push  app.apk  /data/local/tmp/ii….apk
+ * adb shell pm install -r -t -d -g /data/local/tmp/ii….apk
+ * adb shell rm -f /data/local/tmp/ii….apk
  * ```
  *
- * 入口无论「安装页选文件」还是「文件页装远端 APK」，都落到 [installLocalFile]。
- * 不再使用 stdin / 双路径 fallback，避免行为分裂。
+ * Both UI entry points call [installLocalFile] only.
+ * Remote file: copy **on device** to tmp (no phone round-trip), then same pm.
  */
 class ApkInstaller(private val session: AdbSession) {
 
@@ -43,28 +43,31 @@ class ApkInstaller(private val session: AdbSession) {
 
     suspend fun installRemotePath(remotePath: String) = withContext(Dispatchers.IO) {
         session.clearCancel()
-        // 统一：先拉到本机，再走同一套 push + pm（不直接从 /sdcard pm，电视上常失败）
-        val cache = File.createTempFile("apk_remote_", ".apk")
+        val tmp = "/data/local/tmp/ii${System.currentTimeMillis()}.apk"
         try {
-            session.syncPull(remotePath, cache) { }
-            if (cache.length() <= 0L) throw AdbException("无法读取远端 APK")
-            installLocalFile(cache) { /* 文件页装包：进度由外层 banner 表达即可 */ }
-        } finally {
-            cache.delete()
+            // Device-local copy — same end state as push, no phone bandwidth
+            val cpOut = session.shell("cp -f ${session.q(remotePath)} ${session.q(tmp)}")
+            val lower = cpOut.lowercase()
+            if ("no such" in lower || "permission denied" in lower || "read-only" in lower) {
+                throw AdbException("无法复制 APK 到临时目录，请检查路径与权限")
+            }
+            val st = session.syncStat(tmp)
+            if (st.mode == 0 && st.size == 0L) {
+                throw AdbException("临时 APK 未就绪，安装中止")
+            }
+            runPmAndCleanup(tmp, expectedSize = st.size.takeIf { it > 0 })
+        } catch (t: Throwable) {
+            runCatching { session.shell("rm -f ${session.q(tmp)}") }
+            throw if (t is AdbException) t else AdbException(InstallErrors.humanize(t.message ?: ""), t)
         }
     }
 
-    /**
-     * 唯一安装实现：sync 推到 /data/local/tmp → pm install → 删除临时文件。
-     */
     private suspend fun installLocalFile(
         local: File,
         onProgress: (TransferProgress) -> Unit,
     ) {
         val size = local.length()
         if (size <= 0L) throw AdbException("APK 为空")
-
-        // 短 ASCII 路径，保证 shell:pm… 的 OPEN destination < libadb ~104 字节限制
         val remote = "/data/local/tmp/ii${System.currentTimeMillis()}.apk"
 
         onProgress(TransferProgress(0.05f, "正在传输"))
@@ -82,17 +85,32 @@ class ApkInstaller(private val session: AdbSession) {
             if (st.size > 0L && st.size != size) {
                 throw AdbException("传输不完整：本地 ${size}B，远端 ${st.size}B")
             }
+            onProgress(TransferProgress(0.90f, "正在安装（可能需要一分钟）"))
+            runPmAndCleanup(remote, expectedSize = size)
+            onProgress(TransferProgress(1f, "安装成功"))
+        } catch (t: Throwable) {
+            runCatching { session.shell("rm -f ${session.q(remote)}") }
+            throw if (t is AdbException) t
+            else AdbException(InstallErrors.humanize(t.message ?: "安装失败"), t)
+        }
+    }
 
-            onProgress(TransferProgress(0.90f, "正在安装"))
+    private suspend fun runPmAndCleanup(remote: String, expectedSize: Long?) {
+        try {
+            if (expectedSize != null && expectedSize > 0) {
+                val st = session.syncStat(remote)
+                if (st.size > 0 && st.size != expectedSize) {
+                    throw AdbException("安装前校验失败：远端大小 ${st.size}B")
+                }
+            }
             val raw = session.pmInstall(remote)
             val ok = raw.contains("Success", ignoreCase = true) &&
                 !raw.contains("Failure", ignoreCase = true)
             if (!ok) {
                 throw AdbException(InstallErrors.humanize(raw.ifBlank { "安装无输出" }))
             }
-            onProgress(TransferProgress(1f, "安装成功"))
         } finally {
-            runCatching { session.shell("rm -f ${session.q(remote)}", 8_000) }
+            runCatching { session.shell("rm -f ${session.q(remote)}") }
         }
     }
 }

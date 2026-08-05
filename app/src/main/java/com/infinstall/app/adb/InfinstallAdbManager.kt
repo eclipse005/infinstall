@@ -39,11 +39,11 @@ class InfinstallAdbManager private constructor(
     private val certificate: Certificate
 
     init {
-        // Remote wireless debugging needs modern ADB protocol / TLS path.
-        // Using only the *controller* phone's SDK can be wrong if too low; clamp to at least 30.
+        // libadb uses this for protocol max-payload / TLS path selection.
+        // Floor at 30 (Android 11) so wireless debugging TLS works even if controller is older.
+        // Cap is fine: larger max-payload speeds sync SEND on modern links.
         setApi(max(Build.VERSION.SDK_INT, 30))
-        setTimeout(20, TimeUnit.SECONDS)
-        // false: allow first AUTH failure path to surface pairing-needed more cleanly on some devices
+        setTimeout(30, TimeUnit.SECONDS)
         setThrowOnUnauthorised(false)
         val pair = loadOrCreateKeys(context.applicationContext)
         privateKey = pair.first

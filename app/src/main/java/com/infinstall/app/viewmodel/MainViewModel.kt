@@ -103,49 +103,53 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { it.copy(history = list) }
             }
         }
-        // Single source of truth: AdbSession state machine → UI connected flag.
-        // Operation errors do NOT change this. Only connect/disconnect/transport-dead do.
+        // UI connection flags follow AdbSession only (no dual sources).
         viewModelScope.launch {
             session.state.collect { st ->
                 when (st) {
                     is SessionState.Connected -> {
-                        if (!userConnectInFlight) {
-                            _ui.update {
-                                it.copy(
-                                    connected = true,
-                                    connectedEndpoint = st.endpoint,
-                                    connecting = false,
-                                )
-                            }
+                        _ui.update {
+                            it.copy(
+                                connected = true,
+                                connectedEndpoint = st.endpoint,
+                                connecting = false,
+                                pairing = false,
+                            )
                         }
                     }
                     is SessionState.Connecting -> {
                         _ui.update {
                             it.copy(
                                 connecting = true,
+                                pairing = false,
+                                connected = false,
                                 connectBanner = "正在连接 ${st.host}:${st.port} …",
                             )
                         }
                     }
                     is SessionState.Pairing -> {
                         _ui.update {
-                            it.copy(pairing = true, connectBanner = "配对中…")
+                            it.copy(
+                                pairing = true,
+                                connecting = false,
+                                connectBanner = "配对中…",
+                            )
                         }
                     }
                     SessionState.Disconnected -> {
-                        // Do not clear banners/errors here if user is mid-connect attempt —
-                        // connect() catch block owns failure UI.
-                        if (!userConnectInFlight && _ui.value.connected) {
-                            _ui.update {
-                                it.copy(
-                                    connected = false,
-                                    connectedEndpoint = null,
-                                    connecting = false,
-                                    pairing = false,
-                                    // Soft notice only when we were connected and session dropped
-                                    connectBanner = it.connectBanner ?: "连接已结束",
-                                )
-                            }
+                        _ui.update { cur ->
+                            val wasConnected = cur.connected
+                            cur.copy(
+                                connected = false,
+                                connectedEndpoint = null,
+                                connecting = false,
+                                pairing = false,
+                                connectBanner = when {
+                                    userConnectInFlight -> cur.connectBanner
+                                    wasConnected -> cur.connectBanner ?: "连接已结束"
+                                    else -> cur.connectBanner
+                                },
+                            )
                         }
                     }
                 }
@@ -241,26 +245,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             try {
-                // No outer withTimeout — AdbSession owns timeouts; cancel would race the mutex.
                 session.connect(h, p)
                 historyStore.rememberSuccess(h, p)
+                // connected flags already updated via session.state collector
                 _ui.update {
                     it.copy(
-                        connecting = false,
-                        connected = true,
-                        connectedEndpoint = "$h:$p",
                         connectBanner = null,
                         errorMessage = null,
                         tab = MainTab.Install,
+                        hostInput = h,
+                        portInput = p.toString(),
                     )
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
                 _ui.update {
                     it.copy(
-                        connecting = false,
-                        connected = false,
-                        connectedEndpoint = null,
                         connectBanner = null,
                         errorMessage = ErrorMessages.humanize(t, h, p),
                     )

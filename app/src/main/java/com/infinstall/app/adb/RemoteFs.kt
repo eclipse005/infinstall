@@ -12,84 +12,57 @@ import java.io.FileOutputStream
 import java.io.InputStream
 
 /**
- * Remote filesystem — **official ADB practices**:
- * - list / props / upload / download → `sync:` (AdbSync)
- * - delete / mkdir / rename / copy / move → `shell:` only
+ * Remote FS:
+ * - Metadata & transfer → **sync only** (official)
+ * - Mutating commands → **shell only**, then verify with sync when it matters
  */
 class RemoteFs(private val session: AdbSession) {
 
-    /** Official: sync LIST (same family as `adb ls`). */
     suspend fun list(path: String): List<RemoteFile> = withContext(Dispatchers.IO) {
-        val p = normalize(path)
-        try {
-            session.syncList(p)
-        } catch (t: Throwable) {
-            // Soft fallback: shell ls -lA if sync LIST fails on exotic adbd
-            LogFallback.list(session, p, t)
-        }
+        session.syncList(normalize(path))
     }
 
-    /** Official: sync STAT. */
     suspend fun props(path: String): RemoteFileProps = withContext(Dispatchers.IO) {
         val p = path.trim()
-        try {
-            val st = session.syncStat(p)
-            if (!st.exists && st.mode == 0) {
-                throw AdbException("文件不存在")
-            }
-            val name = p.trimEnd('/').substringAfterLast('/').ifBlank { p }
-            RemoteFileProps(
-                path = p,
-                name = name,
-                isDir = st.isDir,
-                isLink = st.isLink,
-                size = st.size,
-                mtimeSec = st.mtimeSec,
-                permissions = modeToPerms(st.mode),
-                owner = "?",
-                typeLabel = when {
-                    st.isDir -> "文件夹"
-                    st.isLink -> "链接"
-                    else -> "文件"
-                },
-                readable = true,
-                writable = true,
-                linkTarget = null,
-            )
-        } catch (t: Throwable) {
-            if (t is AdbException && t.message?.contains("不存在") == true) throw t
-            // Fallback shell ls -ld
-            LogFallback.props(session, p, t)
+        val st = session.syncStat(p)
+        if (st.mode == 0 && st.size == 0L && st.mtimeSec == 0L) {
+            throw AdbException("文件不存在")
         }
+        val name = p.trimEnd('/').substringAfterLast('/').ifBlank { p }
+        RemoteFileProps(
+            path = p,
+            name = name,
+            isDir = st.isDir,
+            isLink = st.isLink,
+            size = st.size,
+            mtimeSec = st.mtimeSec,
+            permissions = modeToPerms(st.mode),
+            owner = "?",
+            typeLabel = when {
+                st.isDir -> "文件夹"
+                st.isLink -> "链接"
+                else -> "文件"
+            },
+            readable = true,
+            writable = true,
+            linkTarget = null,
+        )
     }
 
-    /**
-     * Shell only. Command is written into interactive `shell:` stream
-     * (never as long openStream destination — libadb BufferOverflow).
-     * Verify with sync STAT when possible.
-     */
     suspend fun delete(path: String) = withContext(Dispatchers.IO) {
         val p = path.trim()
-        val qp = session.q(p)
-        val out = session.shell("rm -rf $qp; echo __EC:\$?", 30_000)
+        val st0 = runCatching { session.syncStat(p) }.getOrNull()
+        val isDir = st0?.isDir == true
+        // Safer than always rm -rf: files use rm -f, dirs use rm -r
+        val cmd = if (isDir) "rm -r ${session.q(p)}" else "rm -f ${session.q(p)}"
+        val out = session.shell(cmd, 30_000)
         val lower = out.lowercase()
         if ("permission denied" in lower || "read-only" in lower) {
             throw AdbException(cleanErr("删除失败", out, p))
         }
-        // Prefer official sync STAT to confirm gone (short openStream: "sync:")
-        try {
-            val st = session.syncStat(p)
-            // Non-existent files typically return mode=0,size=0,mtime=0
-            if (st.mode != 0 || st.size != 0L) {
-                throw AdbException("删除失败（文件仍在，可能无权限）\n$p")
-            }
-        } catch (t: Throwable) {
-            if (t is AdbException && t.message?.contains("仍在") == true) throw t
-            // STAT failed / ambiguous — if rm printed no error, accept
-            val ec = Regex("""__EC:(\d+)""").find(out)?.groupValues?.get(1)
-            if (ec != null && ec != "0") {
-                throw AdbException(cleanErr("删除失败", out, p) + " [ec=$ec]")
-            }
+        val st = runCatching { session.syncStat(p) }.getOrNull()
+        if (st != null && (st.mode != 0 || st.size != 0L)) {
+            throw AdbException("删除失败（仍存在，可能无权限）\n$p")
         }
     }
 
@@ -97,28 +70,13 @@ class RemoteFs(private val session: AdbSession) {
         val p = path.trim()
         val out = session.shell("mkdir -p ${session.q(p)}", 12_000)
         val lower = out.lowercase()
-        if ("permission denied" in lower || "read-only" in lower || "no such file" in lower) {
+        if ("permission denied" in lower || "read-only" in lower) {
             throw AdbException(cleanErr("创建失败", out, p))
         }
-        // Verify with sync STAT (reliable); do not depend on shell $? parsing
-        try {
-            val st = session.syncStat(p)
-            if (st.isDir || st.mode != 0) return@withContext
-        } catch (_: Throwable) {
-            // fall through
+        val st = session.syncStat(p)
+        if (!st.isDir && st.mode == 0) {
+            throw AdbException("创建失败（目录未出现）\n$p")
         }
-        // STAT all-zero or failed: treat as fail only if shell looked wrong
-        if (lower.isNotBlank() && ("fail" in lower || "error" in lower || "cannot" in lower)) {
-            throw AdbException(cleanErr("创建失败", out, p))
-        }
-        // Re-check: list parent for name
-        val parent = p.substringBeforeLast('/', "")
-        val name = p.substringAfterLast('/')
-        if (parent.isNotEmpty() && name.isNotEmpty()) {
-            val kids = runCatching { session.syncList(parent) }.getOrNull().orEmpty()
-            if (kids.any { it.name == name && it.isDir }) return@withContext
-        }
-        throw AdbException("创建失败（目录未出现）\n$p")
     }
 
     suspend fun rename(from: String, to: String) = withContext(Dispatchers.IO) {
@@ -127,9 +85,9 @@ class RemoteFs(private val session: AdbSession) {
         if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
             throw AdbException(cleanErr("重命名失败", out, from))
         }
-        val st = runCatching { session.syncStat(to) }.getOrNull()
-        if (st == null || (st.mode == 0 && st.size == 0L)) {
-            throw AdbException(cleanErr("重命名失败", out.ifBlank { "目标不存在" }, from))
+        val st = session.syncStat(to)
+        if (st.mode == 0 && st.size == 0L) {
+            throw AdbException("重命名失败（目标未出现）\n$to")
         }
     }
 
@@ -139,6 +97,10 @@ class RemoteFs(private val session: AdbSession) {
         if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
             throw AdbException(cleanErr("复制失败", out, from))
         }
+        val st = session.syncStat(to)
+        if (st.mode == 0 && st.size == 0L) {
+            throw AdbException("复制失败（目标未出现）\n$to")
+        }
     }
 
     suspend fun move(from: String, to: String) = withContext(Dispatchers.IO) {
@@ -147,9 +109,12 @@ class RemoteFs(private val session: AdbSession) {
         if ("permission denied" in lower || "no such" in lower || "read-only" in lower) {
             throw AdbException(cleanErr("移动失败", out, from))
         }
+        val st = session.syncStat(to)
+        if (st.mode == 0 && st.size == 0L) {
+            throw AdbException("移动失败（目标未出现）\n$to")
+        }
     }
 
-    /** Official: sync SEND. */
     suspend fun upload(
         input: InputStream,
         remotePath: String,
@@ -162,18 +127,17 @@ class RemoteFs(private val session: AdbSession) {
             FileOutputStream(cache).use { input.copyTo(it) }
             val total = cache.length()
             if (total <= 0L) throw AdbException("本地文件为空")
-            onProgress(TransferProgress(0f, "开始传输 ${total / 1024} KB"))
+            onProgress(TransferProgress(0f, "正在传输"))
             session.syncPush(cache, remotePath) { sent, t ->
                 val f = (sent.toFloat() / t.coerceAtLeast(1)).coerceIn(0f, 1f)
-                onProgress(TransferProgress(f, "传输 ${(f * 100).toInt()}%"))
+                onProgress(TransferProgress(f, "正在传输"))
             }
-            onProgress(TransferProgress(1f, "已保存 $remotePath"))
+            onProgress(TransferProgress(1f, "已保存"))
         } finally {
             cache.delete()
         }
     }
 
-    /** Official: sync RECV. */
     suspend fun download(
         remotePath: String,
         local: File,
@@ -188,7 +152,7 @@ class RemoteFs(private val session: AdbSession) {
     private fun cleanErr(prefix: String, out: String, path: String): String {
         val msg = out.lineSequence()
             .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("__EC:") && !it.startsWith("__") }
+            .filter { it.isNotEmpty() && !it.startsWith("__INF_") }
             .joinToString(" ")
             .ifBlank { "未知错误" }
         return "$prefix：$msg\n$path"
@@ -208,134 +172,6 @@ class RemoteFs(private val session: AdbSession) {
             append(bit(0x100, 'r')); append(bit(0x80, 'w')); append(bit(0x40, 'x'))
             append(bit(0x20, 'r')); append(bit(0x10, 'w')); append(bit(0x8, 'x'))
             append(bit(0x4, 'r')); append(bit(0x2, 'w')); append(bit(0x1, 'x'))
-        }
-    }
-}
-
-/** Shell fallbacks when sync is unavailable on odd adbd builds. */
-private object LogFallback {
-    suspend fun list(session: AdbSession, path: String, primary: Throwable): List<RemoteFile> {
-        android.util.Log.w("RemoteFs", "sync LIST failed, shell fallback: ${primary.message}")
-        val out = session.shell("ls -lA ${session.q(path)}", 20_000)
-        val lower = out.lowercase()
-        if (lower.contains("no such file") || lower.contains("not a directory") ||
-            lower.contains("permission denied")
-        ) {
-            throw AdbException(
-                out.lineSequence().firstOrNull { it.isNotBlank() }?.trim()
-                    ?: "无法打开目录",
-            )
-        }
-        val parsed = out.lineSequence()
-            .map { it.trimEnd('\r') }
-            .mapNotNull { LsParser.parseLongLine(it) }
-            .toList()
-        if (parsed.isEmpty() && out.isNotBlank()) {
-            throw AdbException("列目录失败：${primary.message ?: "sync"} / shell 无有效项")
-        }
-        return parsed
-    }
-
-    suspend fun props(session: AdbSession, path: String, primary: Throwable): RemoteFileProps {
-        android.util.Log.w("RemoteFs", "sync STAT failed, shell fallback: ${primary.message}")
-        val out = session.shell("ls -ld ${session.q(path)}", 12_000)
-        val line = out.lineSequence()
-            .map { it.trimEnd('\r').trim() }
-            .firstOrNull { it.isNotEmpty() && !it.startsWith("total") }
-            ?: throw AdbException("无法读取属性（${primary.message}）")
-        if (line.lowercase().contains("no such file")) throw AdbException("文件不存在")
-        val parsed = LsParser.parseLongLine(line)
-            ?: throw AdbException("无法解析属性：$line")
-        val name = path.trimEnd('/').substringAfterLast('/').ifBlank { parsed.name }
-        return RemoteFileProps(
-            path = path,
-            name = name,
-            isDir = parsed.isDir,
-            isLink = parsed.isLink,
-            size = parsed.size,
-            mtimeSec = parsed.mtimeSec,
-            permissions = parsed.permissions,
-            owner = "?",
-            typeLabel = when {
-                parsed.isDir -> "文件夹"
-                parsed.isLink -> "链接"
-                else -> "文件"
-            },
-            readable = true,
-            writable = true,
-            linkTarget = null,
-        )
-    }
-}
-
-/** Parse toybox `ls -l` when sync is unavailable. */
-object LsParser {
-    fun parseLongLine(line: String): RemoteFile? {
-        val trimmed = line.trim()
-        if (trimmed.isEmpty() || trimmed.startsWith("total", ignoreCase = true)) return null
-        if (trimmed.length < 10) return null
-        val mode = trimmed.substringBefore(' ')
-        if (mode.isEmpty()) return null
-        val c = mode[0]
-        if (c != '-' && c != 'd' && c != 'l' && c != 'c' && c != 'b' && c != 'p' && c != 's') {
-            return null
-        }
-        val isDir = c == 'd'
-        val isLink = c == 'l'
-        val rest = trimmed.substring(mode.length).trim()
-        val tokens = rest.split(Regex("\\s+"))
-        if (tokens.size < 5) return null
-
-        var sizeIdx = 3
-        var size = tokens.getOrNull(sizeIdx)?.toLongOrNull()
-        if (size == null) {
-            sizeIdx = tokens.indexOfFirst { it.toLongOrNull() != null && it.length <= 14 }
-            size = tokens.getOrNull(sizeIdx)?.toLongOrNull() ?: 0L
-        }
-        if (sizeIdx < 0) {
-            sizeIdx = 3
-            size = 0L
-        }
-        var nameStart = sizeIdx + 1
-        var mtimeSec = 0L
-        if (nameStart < tokens.size) {
-            val t = tokens[nameStart]
-            when {
-                t.matches(Regex("\\d{4}-\\d{2}-\\d{2}")) -> {
-                    mtimeSec = parseIso(tokens.getOrNull(nameStart), tokens.getOrNull(nameStart + 1))
-                    nameStart += 2
-                }
-                t.matches(Regex("[A-Za-z]{3}")) -> nameStart += 3
-                else -> nameStart += 2
-            }
-        }
-        if (nameStart >= tokens.size) return null
-        var name = tokens.subList(nameStart, tokens.size).joinToString(" ")
-        if (isLink) {
-            val arrow = tokens.indexOf("->")
-            if (arrow > nameStart) name = tokens.subList(nameStart, arrow).joinToString(" ")
-            else if (" -> " in name) name = name.substringBefore(" -> ")
-        }
-        name = name.trim().trimEnd('/')
-        if (name.contains('/')) name = name.substringAfterLast('/')
-        if (name.isEmpty() || name == "." || name == "..") return null
-        return RemoteFile(
-            name = name,
-            isDir = isDir,
-            size = if (isDir) 0L else size,
-            mtimeSec = mtimeSec,
-            permissions = mode,
-            isLink = isLink,
-        )
-    }
-
-    private fun parseIso(date: String?, time: String?): Long {
-        if (date == null || time == null) return 0L
-        return try {
-            val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
-            (fmt.parse("$date $time")?.time ?: 0L) / 1000L
-        } catch (_: Exception) {
-            0L
         }
     }
 }
