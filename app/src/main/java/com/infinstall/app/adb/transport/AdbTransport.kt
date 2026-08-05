@@ -151,17 +151,68 @@ class AdbTransport(
     }
 
     /**
+     * Official install decomposition (host `adb install`), **one serial bus hold**:
+     *
+     * ```
+     * sync SEND  → remoteApkPath
+     * shell:pm install -r -t -d -g remoteApkPath
+     * shell: rm -f remoteApkPath
+     * ```
+     *
+     * Caller must already hold [withSerial] (or use [AdbSession] wrapper).
+     * Holding the bus for the whole recipe prevents link-watch / other ops from
+     * interleaving mid-install (a common source of "Stream closed" on install #2+).
+     */
+    fun installPushPmRm(
+        local: File,
+        remoteApkPath: String,
+        onProgress: (sent: Long, total: Long) -> Unit,
+        pushTimeoutMs: Long = 300_000,
+        pmTimeoutMs: Long = 180_000,
+    ): String {
+        require(SAFE_TMP_APK.matches(remoteApkPath)) {
+            "install path must be /data/local/tmp/ii<digits>.apk, got $remoteApkPath"
+        }
+        ensureLive()
+        checkCancel()
+        val expected = local.length()
+        if (!local.isFile || expected <= 0L) throw AdbException("本地文件无效")
+
+        // Parent /data/local/tmp always exists on device; skip mkdir to avoid extra shell churn
+        timed(pushTimeoutMs) { active ->
+            withSync(active) { sync ->
+                sync.push(
+                    local = local,
+                    remotePath = remoteApkPath,
+                    onProgress = onProgress,
+                    checkCancel = { checkCancel() },
+                )
+            }
+        }
+        val st = syncStat(remoteApkPath, 15_000)
+        if (st.size > 0L && st.size != expected) {
+            runCatching { shell("rm -f ${q(remoteApkPath)}", 8_000) }
+            throw AdbException("传输不完整：本地 ${expected}B，远端 ${st.size}B")
+        }
+
+        val raw = try {
+            pmInstall(remoteApkPath, pmTimeoutMs)
+        } finally {
+            runCatching { shell("rm -f ${q(remoteApkPath)}", 8_000) }
+        }
+        return raw
+    }
+
+    /**
      * Official one-shot: `adb shell pm install -r -t -d -g <path>`.
      *
-     * Path **must** match [SAFE_TMP_APK] (ASCII, short) so OPEN destination
-     * stays under libadb's buffer limit and matches host `adb shell` semantics
-     * (process exits when pm finishes — no interactive stdin/marker).
+     * Path **must** match [SAFE_TMP_APK] (ASCII, short). Remote closes the stream when
+     * pm finishes — that close is **success EOF**, not a session failure.
      */
-    fun pmInstall(remoteApkPath: String, timeoutMs: Long = 120_000): String {
+    fun pmInstall(remoteApkPath: String, timeoutMs: Long = 180_000): String {
         require(SAFE_TMP_APK.matches(remoteApkPath)) {
             "pm install path must be /data/local/tmp/ii<digits>.apk, got $remoteApkPath"
         }
-        // Exactly like: adb shell pm install -r -t -d -g /data/local/tmp/ii….apk
         val cmd = "pm install -r -t -d -g $remoteApkPath"
         val out = shellOneShotAscii(cmd, timeoutMs)
         Log.i(TAG, "pmInstall out=${out.take(300)}")
@@ -197,13 +248,36 @@ class AdbTransport(
         val input = stream.openInputStream()
         val bos = ByteArrayOutputStream()
         val buf = ByteArray(8 * 1024)
-        while (bos.size() < maxBytes) {
-            val n = input.read(buf)
-            if (n < 0) break
-            if (n == 0) continue
-            bos.write(buf, 0, n)
+        try {
+            while (bos.size() < maxBytes) {
+                val n = try {
+                    input.read(buf)
+                } catch (t: Throwable) {
+                    // Peer closed service after command — normal EOF for one-shot shell
+                    if (isStreamClosedError(t)) break
+                    throw t
+                }
+                if (n < 0) break
+                if (n == 0) continue
+                bos.write(buf, 0, n)
+            }
+        } catch (t: Throwable) {
+            if (bos.size() > 0 && isStreamClosedError(t)) {
+                // Got payload then stream closed — keep what we read (often "Success")
+                Log.w(TAG, "readUntilEof stream closed after ${bos.size()}B (keep payload)")
+            } else {
+                throw t
+            }
         }
         return bos.toString(StandardCharsets.UTF_8.name()).trim()
+    }
+
+    private fun isStreamClosedError(t: Throwable): Boolean {
+        val msg = generateSequence(t) { it.cause }
+            .joinToString(" ") { listOfNotNull(it.javaClass.simpleName, it.message).joinToString(" ") }
+            .lowercase()
+        return "stream closed" in msg ||
+            (t is java.io.IOException && "closed" in msg && "connection reset" !in msg)
     }
 
     // ── sync ───────────────────────────────────────────────
@@ -335,8 +409,21 @@ class AdbTransport(
         return try {
             manager.openStream(dest)
         } catch (t: Throwable) {
+            // Official research: single stream failure may be transient — retry once
+            // when the ADB link itself is still up (common after previous stream close).
+            if (manager.isConnected && isStreamClosedError(t)) {
+                Log.w(TAG, "openStream retry once after stream closed: ${dest.take(48)}")
+                try {
+                    return manager.openStream(dest)
+                } catch (t2: Throwable) {
+                    Log.e(TAG, "openStream retry failed: ${t2.javaClass.simpleName} ${t2.message}")
+                    if (!manager.isConnected || isConnectionDead(t2)) {
+                        onTransportDead(t2.message ?: t2.javaClass.simpleName)
+                    }
+                    throw mapIo(t2)
+                }
+            }
             Log.e(TAG, "openStream ${dest.take(60)}: ${t.javaClass.simpleName} ${t.message}")
-            // Only tear down session on unmistakable link death — never on stream noise
             if (!manager.isConnected || isConnectionDead(t)) {
                 onTransportDead(t.message ?: t.javaClass.simpleName)
             }
@@ -369,16 +456,16 @@ class AdbTransport(
 
     private fun mapIo(t: Throwable): Throwable {
         if (t is TransferCancelledException || t is AdbException) return t
-        val detail = listOfNotNull(t.javaClass.simpleName, t.message?.take(160))
-            .joinToString(": ")
-        val m = (t.message ?: "").lowercase()
+        val m = generateSequence(t) { it.cause }
+            .joinToString(" ") { listOfNotNull(it.javaClass.simpleName, it.message).joinToString(" ") }
+            .lowercase()
         return when {
             t is java.nio.BufferOverflowException || "bufferoverflow" in m.replace(" ", "") ->
                 AdbException("ADB OPEN 缓冲错误（库缺陷）。请断开后重连。", t)
-            "closed" in m ->
-                AdbException("通道异常，请重试（无需立刻重连）\n$detail", t)
+            isStreamClosedError(t) || "stream closed" in m ->
+                AdbException("通道瞬时异常，请再试一次（一般不用重连）", t)
             else ->
-                AdbException("通信失败\n$detail", t)
+                AdbException("通信失败，请重试", t)
         }
     }
 
@@ -387,13 +474,23 @@ class AdbTransport(
         val bos = ByteArrayOutputStream()
         val buf = ByteArray(8 * 1024)
         val text = StringBuilder()
-        while (bos.size() < maxBytes) {
-            val n = input.read(buf)
-            if (n < 0) break
-            if (n == 0) continue
-            bos.write(buf, 0, n)
-            text.append(String(buf, 0, n, StandardCharsets.UTF_8))
-            if (text.contains(marker)) break
+        try {
+            while (bos.size() < maxBytes) {
+                val n = try {
+                    input.read(buf)
+                } catch (t: Throwable) {
+                    if (isStreamClosedError(t)) break
+                    throw t
+                }
+                if (n < 0) break
+                if (n == 0) continue
+                bos.write(buf, 0, n)
+                text.append(String(buf, 0, n, StandardCharsets.UTF_8))
+                if (text.contains(marker)) break
+            }
+        } catch (t: Throwable) {
+            if (!(bos.size() > 0 && isStreamClosedError(t))) throw t
+            Log.w(TAG, "readUntilMarker stream closed after ${bos.size()}B (keep payload)")
         }
         val full = bos.toString(StandardCharsets.UTF_8.name())
         val idx = full.indexOf(marker)
@@ -422,13 +519,12 @@ class AdbTransport(
             throw AdbException("操作超时（${timeoutMs / 1000}s），请重试")
         } catch (e: Exception) {
             closeQuiet(active.getAndSet(null))
-            val c = e.cause ?: e
+            // Future.get wraps worker failures in ExecutionException
+            val c = if (e is java.util.concurrent.ExecutionException) (e.cause ?: e) else (e.cause ?: e)
             when (c) {
                 is AdbException -> throw c
                 is TransferCancelledException -> throw c
-                is RuntimeException -> throw c
-                is Exception -> throw AdbException(c.message ?: "操作失败", c)
-                else -> throw AdbException(c.message ?: "操作失败", c)
+                else -> throw mapIo(c)
             }
         }
     }

@@ -18,8 +18,10 @@ import java.io.InputStream
  * adb shell rm -f /data/local/tmp/ii….apk
  * ```
  *
- * Both UI entry points call [installLocalFile] only.
- * Remote file: copy **on device** to tmp (no phone round-trip), then same pm.
+ * Local installs run the whole recipe under **one** session serial lock
+ * ([AdbSession.installLocalApk]) so no other ADB stream can interleave.
+ *
+ * Remote file: copy on device to tmp, then pm + rm (same end state).
  */
 class ApkInstaller(private val session: AdbSession) {
 
@@ -45,7 +47,6 @@ class ApkInstaller(private val session: AdbSession) {
         session.clearCancel()
         val tmp = "/data/local/tmp/ii${System.currentTimeMillis()}.apk"
         try {
-            // Device-local copy — same end state as push, no phone bandwidth
             val cpOut = session.shell("cp -f ${session.q(remotePath)} ${session.q(tmp)}")
             val lower = cpOut.lowercase()
             if ("no such" in lower || "permission denied" in lower || "read-only" in lower) {
@@ -55,10 +56,16 @@ class ApkInstaller(private val session: AdbSession) {
             if (st.mode == 0 && st.size == 0L) {
                 throw AdbException("临时 APK 未就绪，安装中止")
             }
-            runPmAndCleanup(tmp, expectedSize = st.size.takeIf { it > 0 })
+            val raw = session.pmInstall(tmp)
+            val ok = "success" in raw.lowercase() && "failure" !in raw.lowercase()
+            if (!ok) {
+                android.util.Log.e("ApkInstaller", "pm install failed raw=${raw.take(400)}")
+                throw AdbException(InstallErrors.humanize(raw.ifBlank { "安装无输出" }))
+            }
         } catch (t: Throwable) {
-            runCatching { session.shell("rm -f ${session.q(tmp)}") }
             throw if (t is AdbException) t else AdbException(InstallErrors.humanize(t.message ?: ""), t)
+        } finally {
+            runCatching { session.shell("rm -f ${session.q(tmp)}") }
         }
     }
 
@@ -72,46 +79,34 @@ class ApkInstaller(private val session: AdbSession) {
 
         onProgress(TransferProgress(0.05f, "正在传输"))
         var lastPct = -1
+        var sawPushDone = false
         try {
-            session.syncPush(local, remote) { sent, total ->
+            // Entire push + pm + rm under one serial lock (see AdbSession.installLocalApk)
+            val raw = session.installLocalApk(local, remote) { sent, total ->
                 val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
                 val pct = (f * 100).toInt()
                 if (pct != lastPct) {
                     lastPct = pct
-                    onProgress(TransferProgress(0.05f + f * 0.80f, "正在传输"))
+                    if (f >= 0.999f && !sawPushDone) {
+                        sawPushDone = true
+                        onProgress(TransferProgress(0.90f, "正在安装（可能需要一分钟）"))
+                    } else if (!sawPushDone) {
+                        onProgress(TransferProgress(0.05f + f * 0.85f, "正在传输"))
+                    }
                 }
             }
-            val st = session.syncStat(remote)
-            if (st.size > 0L && st.size != size) {
-                throw AdbException("传输不完整：本地 ${size}B，远端 ${st.size}B")
-            }
-            onProgress(TransferProgress(0.90f, "正在安装（可能需要一分钟）"))
-            runPmAndCleanup(remote, expectedSize = size)
-            onProgress(TransferProgress(1f, "安装成功"))
-        } catch (t: Throwable) {
-            runCatching { session.shell("rm -f ${session.q(remote)}") }
-            throw if (t is AdbException) t
-            else AdbException(InstallErrors.humanize(t.message ?: "安装失败"), t)
-        }
-    }
-
-    private suspend fun runPmAndCleanup(remote: String, expectedSize: Long?) {
-        try {
-            if (expectedSize != null && expectedSize > 0) {
-                val st = session.syncStat(remote)
-                if (st.size > 0 && st.size != expectedSize) {
-                    throw AdbException("安装前校验失败：远端大小 ${st.size}B")
-                }
-            }
-            val raw = session.pmInstall(remote)
             val lower = raw.lowercase()
             val ok = "success" in lower && "failure" !in lower
             if (!ok) {
                 android.util.Log.e("ApkInstaller", "pm install failed raw=${raw.take(400)}")
                 throw AdbException(InstallErrors.humanize(raw.ifBlank { "安装无输出" }))
             }
-        } finally {
+            onProgress(TransferProgress(1f, "安装成功"))
+        } catch (t: Throwable) {
+            // installPushPmRm already tries rm; best-effort if we failed before that
             runCatching { session.shell("rm -f ${session.q(remote)}") }
+            throw if (t is AdbException) t
+            else AdbException(InstallErrors.humanize(t.message ?: "安装失败"), t)
         }
     }
 }

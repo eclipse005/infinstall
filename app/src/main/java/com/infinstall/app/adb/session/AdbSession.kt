@@ -297,6 +297,30 @@ class AdbSession private constructor(context: Context) {
         }
     }
 
+    /**
+     * Full `adb install` recipe under **one** serial bus hold:
+     * push → pm install → rm. Prevents link-watch and other ops from interleaving.
+     */
+    suspend fun installLocalApk(
+        local: File,
+        remoteApkPath: String,
+        onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
+    ): String = withContext(Dispatchers.IO) {
+        requireConnected()
+        try {
+            transport.withSerial {
+                transport.installPushPmRm(
+                    local = local,
+                    remoteApkPath = remoteApkPath,
+                    onProgress = onProgress,
+                )
+            }
+        } catch (t: Throwable) {
+            noteOpError(t)
+            throw t
+        }
+    }
+
     fun q(path: String): String = transport.q(path)
 
     private fun requireConnected(): SessionState.Connected {

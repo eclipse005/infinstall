@@ -25,12 +25,22 @@ UI → TvSession → AdbSession (唯一会话状态机)
 ## 安装（唯一路径）
 
 ```
+【整段占有串行总线，禁止 link-watch / 其它 op 插队】
 sync SEND → /data/local/tmp/ii….apk
 shell:pm install -r -t -d -g /data/local/tmp/ii….apk   # one-shot OPEN
 rm 临时文件
 ```
 
-远端 APK：设备内 `cp` 到 tmp，再同一 pm。
+远端 APK：设备内 `cp` 到 tmp，再 pm + rm。
+
+### Stream closed（设计层处理）
+
+ADB 单流结束时常抛 `Stream closed`，**≠ 会话死亡**：
+
+1. 读 one-shot/shell 时：当正常 EOF 处理，保留已读到的 `Success`  
+2. 再 OPEN 时：若 manager 仍 connected，**重试 1 次**（官方研究 P0）  
+3. UI 文案：通道瞬时异常，请再试（不要英文 stream closed）  
+4. 安装整段单锁：避免第一次装完后插队流把第二次 OPEN 打成 stream closed
 
 ## 会话生命周期（粘性 / sticky）
 

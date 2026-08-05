@@ -5,6 +5,10 @@ object ErrorMessages {
         // Prefer our wrapped messages (already Chinese + detail)
         val direct = throwable.message.orEmpty()
         if (throwable is AdbException && direct.isNotBlank()) {
+            val dLow = direct.lowercase()
+            if ("stream closed" in dLow || ("stream" in dLow && "closed" in dLow)) {
+                return "通道瞬时异常，请再试一次（一般不用重连）"
+            }
             // Install failures: strip technical pm/__EC noise if still present
             if (direct.contains("Failure", ignoreCase = true) ||
                 direct.contains("INSTALL_", ignoreCase = true) ||
@@ -13,7 +17,8 @@ object ErrorMessages {
             ) {
                 return InstallErrors.humanize(direct)
             }
-            return direct
+            // Prefer first line of multi-line AdbException (no English stack crumbs)
+            return direct.lineSequence().first().trim()
         }
         if (direct.isNotBlank() && (
                 direct.contains("连不上") ||
