@@ -94,17 +94,17 @@ class AdbTransport(
         return try {
             if (!isSessionLive()) return LinkHealth.Dead
             if (!manager.isConnected) return LinkHealth.Dead
-            // Lightest protocol touch: same as host `adb shell echo …`
-            val out = shellOneShotAscii("echo __PING_OK__", LINK_OBSERVE_TIMEOUT_MS)
+            // Same path as real ops: interactive shell: + short script (not a second TCP)
+            val out = shell("echo __PING_OK__", LINK_OBSERVE_TIMEOUT_MS)
             if (out.contains("__PING_OK__")) {
                 LinkHealth.Ok
             } else {
-                // Empty/garbled output: stream issue, not proof the link is dead
                 Log.w(TAG, "observeLink transient soft-miss out=${out.take(80)}")
                 LinkHealth.Transient
             }
         } catch (t: Throwable) {
             Log.w(TAG, "observeLink: ${t.javaClass.simpleName} ${t.message}")
+            // Dead only when manager is down or error is unmistakable link death
             if (!manager.isConnected || isConnectionDead(t)) {
                 LinkHealth.Dead
             } else {
@@ -336,7 +336,8 @@ class AdbTransport(
             manager.openStream(dest)
         } catch (t: Throwable) {
             Log.e(TAG, "openStream ${dest.take(60)}: ${t.javaClass.simpleName} ${t.message}")
-            if (isConnectionDead(t)) {
+            // Only tear down session on unmistakable link death — never on stream noise
+            if (!manager.isConnected || isConnectionDead(t)) {
                 onTransportDead(t.message ?: t.javaClass.simpleName)
             }
             throw mapIo(t)
@@ -344,53 +345,26 @@ class AdbTransport(
     }
 
     /**
-     * True only when the **ADB connection** (TCP/TLS to adbd) is gone —
-     * not when a single stream glitches.
+     * Unmistakable **connection** death (whole ADB link to adbd).
      *
-     * This is the sole classifier for [LinkHealth.Dead] / [onTransportDead].
+     * Strict by design: single-stream errors (Stream closed, EOF, generic SocketException,
+     * most SSL read/write noise) must NOT kill the session — that caused connect→instant drop.
      */
     private fun isConnectionDead(t: Throwable): Boolean {
         if (t is java.nio.BufferOverflowException) return false
-        // Walk cause chain (libadb often wraps the socket/SSL error)
-        val chain = generateSequence(t) { it.cause }.toList()
-        val msg = chain.joinToString(" ") {
-            listOfNotNull(it.javaClass.simpleName, it.message).joinToString(" ")
-        }.lowercase()
-
-        // Single-stream / protocol noise — session stays up
-        if ("stream closed" in msg &&
-            "connection reset" !in msg &&
-            "broken pipe" !in msg &&
-            "not connected" !in msg
-        ) {
-            return false
-        }
-        if (chain.any { it is java.io.EOFException } &&
-            "connection reset" !in msg &&
-            "broken pipe" !in msg
-        ) {
-            return false
-        }
-
+        val msg = generateSequence(t) { it.cause }
+            .joinToString(" ") {
+                listOfNotNull(it.javaClass.simpleName, it.message).joinToString(" ")
+            }
+            .lowercase()
+        // Always treat as stream-local
+        if ("stream closed" in msg) return false
+        if ("bufferoverflow" in msg.replace(" ", "")) return false
         return "connection reset" in msg ||
             "broken pipe" in msg ||
             "not connected" in msg ||
             "failed to connect" in msg ||
-            "socket closed" in msg ||
-            "connection abort" in msg ||
-            "software caused connection abort" in msg ||
-            "connection refused" in msg ||
-            chain.any { it is java.net.SocketException } ||
-            chain.any {
-                it is javax.net.ssl.SSLException && (
-                    "reset" in (it.message ?: "").lowercase() ||
-                        "abort" in (it.message ?: "").lowercase() ||
-                        "closed" in (it.message ?: "").lowercase() ||
-                        "connection" in (it.message ?: "").lowercase() ||
-                        "read error" in (it.message ?: "").lowercase() ||
-                        "write error" in (it.message ?: "").lowercase()
-                    )
-            }
+            "software caused connection abort" in msg
     }
 
     private fun mapIo(t: Throwable): Throwable {

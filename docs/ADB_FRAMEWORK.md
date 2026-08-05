@@ -36,13 +36,25 @@ rm 临时文件
 
 与 host `adb` 语义一致：**连上且 adbd 链路仍在 → 长期 Connected**。
 
+### 连接顺序（正确）
+
+```
+Connecting
+  → managerConnect（CNXN/TLS 握手成功）
+  → Connected          ← 此时链路已存在，UI 显示已连接
+  → 可选 shell 软检查（失败且 manager 仍 connected → 保持 Connected）
+  → link-watch 启动
+```
+
+**禁止**在尚未 `Connected` 时因 `ensureLive` 拒绝 shell 而把刚握手成功的连接拆掉。
+
 ### 允许离开 Connected 的原因（仅此）
 
 | 原因 | 说明 |
 |------|------|
 | 用户点断开 | [disconnect] |
-| connect 失败 | 握手/探活失败 |
-| **链路已死** | connection reset / broken pipe / manager 非 connected |
+| connect 失败 | **握手**失败（managerConnect 失败 / manager 未 connected） |
+| **链路已死** | connection reset / broken pipe / not connected / manager 断开 |
 
 ### 明确不离开 Connected
 

@@ -73,7 +73,13 @@ class AdbSession private constructor(context: Context) {
 
     private val transport = AdbTransport(
         manager = manager,
-        isSessionLive = { _state.value is SessionState.Connected },
+        // I/O allowed while Connecting (handshake) or Connected — not while idle Disconnected
+        isSessionLive = {
+            when (_state.value) {
+                is SessionState.Connected, is SessionState.Connecting -> true
+                else -> false
+            }
+        },
         onTransportDead = { detail ->
             Log.w(TAG, "transport proved dead during op: $detail")
             dropBecauseLinkDead(fromTransportCallback = true)
@@ -111,25 +117,32 @@ class AdbSession private constructor(context: Context) {
             transport.managerDisconnect()
             _state.value = SessionState.Connecting(h, port)
             try {
+                // 1) ADB CNXN/TLS handshake — this is the real "connect"
                 transport.managerConnect(h, port)
-                // Prove the session can run a command before advertising Connected
-                val probe = transport.withSerial {
-                    transport.shell("echo infinstall_ok", 12_000)
+                if (!transport.managerReportsConnected()) {
+                    error("握手未完成")
                 }
-                if (!probe.contains("infinstall_ok")) {
-                    // Soft miss at connect: still treat as up if manager connected;
-                    // sticky policy — do not fail connect on soft shell noise alone
-                    // unless manager already dead.
-                    if (!transport.managerReportsConnected()) {
-                        error("握手后链路不可用")
-                    }
-                    Log.w(TAG, "connect probe soft-miss: ${probe.take(80)}")
-                }
+                // 2) Advertise Connected as soon as the link exists (sticky model)
                 _state.value = SessionState.Connected(
                     host = h,
                     port = port,
                     sinceMs = SystemClock.elapsedRealtime(),
                 )
+                // 3) Soft shell check — failure here is op noise unless link is proven dead
+                try {
+                    val probe = transport.withSerial {
+                        transport.shell("echo infinstall_ok", 12_000)
+                    }
+                    if (!probe.contains("infinstall_ok")) {
+                        Log.w(TAG, "connect shell soft-miss: ${probe.take(80)}")
+                    }
+                } catch (t: Throwable) {
+                    if (!transport.managerReportsConnected()) {
+                        throw t
+                    }
+                    // Link still up — stay Connected (do not tear down the session)
+                    Log.w(TAG, "connect shell soft-fail (stay up): ${t.message}")
+                }
                 Log.i(TAG, "connected $h:$port")
                 startLinkWatch()
             } catch (t: Throwable) {
