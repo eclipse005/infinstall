@@ -25,8 +25,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -36,7 +34,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * - user [disconnect]
  * - failed [connect]
  * - proven transport death
- * - keepalive heartbeat (TCP port + ADB echo)
+ * - keepalive: consecutive ADB echo failures (no extra TCP probes —
+ *   many adbd only accept one client; a second connect falsely looks "dead")
  */
 class AdbSession private constructor(context: Context) {
     private val app = context.applicationContext
@@ -139,17 +138,16 @@ class AdbSession private constructor(context: Context) {
     }
 
     /**
-     * Heartbeat while Connected (background coroutine, not a system service).
+     * Heartbeat while Connected (background coroutine).
      *
-     * Each tick (~[KEEPALIVE_INTERVAL_MS]):
-     * 1. **TCP port probe** to host:port — wireless debugging OFF usually closes this
-     *    port; works even when the old ADB TLS session is half-open / fake-alive.
-     * 2. **ADB one-shot echo** (if bus free) — confirms the session still speaks ADB.
+     * Only probes over the **existing** ADB session (`shell:echo`).
+     * Do **not** open a second TCP connection to host:port — many TV/box adbd
+     * allow only one client; that "port probe" was causing false disconnects.
      *
      * Drop when:
-     * - peer clearly dead (ADB Dead / manager down)
-     * - [KEEPALIVE_FAIL_THRESHOLD] consecutive soft fails (TCP or ADB)
-     * - no successful tick for [KEEPALIVE_STALE_MS]
+     * - ADB reports clear peer death
+     * - [KEEPALIVE_FAIL_THRESHOLD] consecutive soft fails while idle
+     * - no healthy tick for [KEEPALIVE_STALE_MS] (half-open / hung)
      */
     private fun startKeepAlive() {
         stopKeepAlive()
@@ -163,8 +161,7 @@ class AdbSession private constructor(context: Context) {
             )
             while (isActive) {
                 delay(KEEPALIVE_INTERVAL_MS)
-                val st = _state.value
-                if (st !is SessionState.Connected) break
+                if (_state.value !is SessionState.Connected) break
 
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastOkAt >= KEEPALIVE_STALE_MS) {
@@ -176,37 +173,21 @@ class AdbSession private constructor(context: Context) {
                     break
                 }
 
-                // ── 1) TCP: is the wireless-debug port still accepting? ──
-                // This is the reliable signal when the user toggles remote debugging off.
-                if (!isAdbPortOpen(st.host, st.port, TCP_PROBE_TIMEOUT_MS)) {
-                    val n = probeFailStreak.incrementAndGet()
-                    Log.w(TAG, "heartbeat TCP fail ${hostPort(st)} streak=$n")
-                    if (n >= KEEPALIVE_FAIL_THRESHOLD) {
-                        dropToDisconnected(
-                            reason = "设备端调试已关闭或网络中断，请重新连接",
-                            fromTransport = false,
-                        )
-                        break
-                    }
-                    continue
-                }
-
-                // ── 2) ADB session echo (skip if bus busy with install/push) ──
                 when (val r = transport.tryLightPing()) {
                     AdbTransport.LightPing.Busy -> {
-                        // Port is open + real op running → count as healthy tick
+                        // Real install/push holds the bus — connection is in use
                         probeFailStreak.set(0)
                         lastOkAt = SystemClock.elapsedRealtime()
-                        Log.d(TAG, "heartbeat ok (busy, port open)")
+                        Log.d(TAG, "heartbeat ok (busy)")
                     }
                     AdbTransport.LightPing.Alive -> {
                         probeFailStreak.set(0)
                         lastOkAt = SystemClock.elapsedRealtime()
-                        Log.d(TAG, "heartbeat ok (adb)")
+                        Log.d(TAG, "heartbeat ok")
                     }
                     AdbTransport.LightPing.Fail -> {
                         val n = probeFailStreak.incrementAndGet()
-                        Log.w(TAG, "heartbeat ADB fail streak=$n")
+                        Log.w(TAG, "heartbeat soft-fail streak=$n")
                         if (n >= KEEPALIVE_FAIL_THRESHOLD) {
                             dropToDisconnected(
                                 reason = "设备端调试已关闭或网络中断，请重新连接",
@@ -227,22 +208,6 @@ class AdbSession private constructor(context: Context) {
             Log.i(TAG, "heartbeat loop end")
         }
     }
-
-    /** True if something still accepts TCP on the ADB connect port (LAN). */
-    private fun isAdbPortOpen(host: String, port: Int, timeoutMs: Int): Boolean {
-        return try {
-            Socket().use { socket ->
-                socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(host, port), timeoutMs)
-            }
-            true
-        } catch (t: Throwable) {
-            Log.w(TAG, "tcpProbe $host:$port: ${t.javaClass.simpleName} ${t.message}")
-            false
-        }
-    }
-
-    private fun hostPort(st: SessionState.Connected): String = "${st.host}:${st.port}"
 
     private fun stopKeepAlive() {
         keepAliveJob?.cancel()
@@ -371,13 +336,11 @@ class AdbSession private constructor(context: Context) {
     companion object {
         private const val TAG = "AdbSession"
         /** Heartbeat period while Connected */
-        private const val KEEPALIVE_INTERVAL_MS = 5_000L
-        /** Consecutive soft fails (TCP or ADB) before drop */
-        private const val KEEPALIVE_FAIL_THRESHOLD = 2
+        private const val KEEPALIVE_INTERVAL_MS = 8_000L
+        /** Consecutive soft ADB fails before drop (avoid flaky single miss) */
+        private const val KEEPALIVE_FAIL_THRESHOLD = 3
         /** No healthy tick within this window → force drop */
-        private const val KEEPALIVE_STALE_MS = 25_000L
-        /** TCP connect timeout for port liveness (wireless debugging off → refuse/timeout) */
-        private const val TCP_PROBE_TIMEOUT_MS = 2_000
+        private const val KEEPALIVE_STALE_MS = 60_000L
 
         @Volatile
         private var instance: AdbSession? = null

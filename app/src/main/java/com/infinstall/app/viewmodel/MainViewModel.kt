@@ -140,6 +140,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         _ui.update { cur ->
                             val wasConnected = cur.connected
                             val drop = session.lastDropReason
+                            // One banner only: drop reason → orange error card.
+                            // Do not also fill connectBanner (that was a second blue card).
                             cur.copy(
                                 connected = false,
                                 connectedEndpoint = null,
@@ -151,13 +153,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                                 transferLabel = if (wasConnected) null else cur.transferLabel,
                                 connectBanner = when {
                                     userConnectInFlight -> cur.connectBanner
-                                    wasConnected && !drop.isNullOrBlank() -> drop
-                                    wasConnected -> "连接已结束"
+                                    wasConnected -> null
                                     else -> cur.connectBanner
                                 },
                                 errorMessage = when {
                                     userConnectInFlight -> cur.errorMessage
                                     wasConnected && !drop.isNullOrBlank() -> drop
+                                    wasConnected -> "连接已结束"
                                     else -> cur.errorMessage
                                 },
                                 tab = if (wasConnected && !userConnectInFlight) {

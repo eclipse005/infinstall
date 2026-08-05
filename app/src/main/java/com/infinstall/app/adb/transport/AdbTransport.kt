@@ -71,15 +71,11 @@ class AdbTransport(
     }
 
     /**
-     * Non-blocking keepalive probe. Skips if another op holds the mutex.
-     * Must not be called while already holding [mutex].
-     *
-     * Uses short one-shot OPEN `shell:echo …` (not interactive shell + marker),
-     * so peer death when wireless debugging is toggled off fails fast.
+     * Non-blocking keepalive probe on the **existing** ADB session only.
+     * Skips if another op holds the mutex. Must not hold [mutex] already.
      */
     fun tryLightPing(): LightPing {
         if (!mutex.tryLock()) {
-            // Real op holds the bus — cannot probe. Caller must NOT treat Busy as Alive.
             return if (!manager.isConnected) LightPing.Dead else LightPing.Busy
         }
         return try {
@@ -98,36 +94,11 @@ class AdbTransport(
             }
         } catch (t: Throwable) {
             Log.w(TAG, "lightPing: ${t.javaClass.simpleName} ${t.message}")
-            if (!manager.isConnected || isPeerGone(t)) LightPing.Dead else LightPing.Fail
+            // Only clear transport death → Dead; timeouts / flaky streams → Fail (streak)
+            if (!manager.isConnected || isConnectionDead(t)) LightPing.Dead else LightPing.Fail
         } finally {
             mutex.unlock()
         }
-    }
-
-    /**
-     * Peer / link gone — light ping maps these to immediate Dead.
-     * Timeouts stay as soft Fail (need streak) to avoid one slow probe dropping the session.
-     * Broader than [isConnectionDead] used by regular ops.
-     */
-    private fun isPeerGone(t: Throwable): Boolean {
-        if (isConnectionDead(t)) return true
-        val chain = generateSequence(t) { it.cause }
-            .joinToString(" ") { ((it.message ?: "") + " " + it.javaClass.simpleName) }
-            .lowercase()
-        // Do not treat plain "超时/timeout" as Dead — counted by fail streak instead
-        return t is java.net.SocketException ||
-            t is java.net.ConnectException ||
-            t is javax.net.ssl.SSLException ||
-            t is java.io.EOFException ||
-            "socketexception" in chain ||
-            "sslexception" in chain ||
-            "connection reset" in chain ||
-            "broken pipe" in chain ||
-            "connection refused" in chain ||
-            "network is unreachable" in chain ||
-            "software caused connection abort" in chain ||
-            "not connected" in chain ||
-            "connection abort" in chain
     }
 
     // ── shell ──────────────────────────────────────────────
@@ -439,8 +410,8 @@ class AdbTransport(
         private const val SERVICE_SHELL = "shell:"
         private const val SERVICE_SYNC = "sync:"
         private const val MAX_SHELL_OUT = 4 * 1024 * 1024
-        /** Keep short so remote ADB off is noticed within one interval. */
-        private const val PING_TIMEOUT_MS = 3_000L
+        /** Allow slow TV shells; soft fails still need a streak to drop. */
+        private const val PING_TIMEOUT_MS = 6_000L
 
         /** Only these temp names are used for pm install (ASCII, no spaces/quotes). */
         val SAFE_TMP_APK: Regex = Regex("""^/data/local/tmp/ii\d+\.apk$""")
