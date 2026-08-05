@@ -94,11 +94,12 @@ class ApkInstaller(private val session: AdbSession) {
             val ok = "success" in lower && "failure" !in lower
             if (!ok) {
                 android.util.Log.e("ApkInstaller", "pm install failed raw=${run.pmOutput.take(400)}")
-                // Remote kept for retry — tell user clearly
-                val tip = InstallErrors.humanize(run.pmOutput.ifBlank { "安装无输出" })
+                val raw = run.pmOutput.ifBlank { "安装无输出" }
+                val tip = InstallErrors.humanize(raw)
+                // Permanent pm errors (ABI/signature/…): reuse tip is misleading
+                val withReuse = !InstallErrors.isPermanentPackageError(raw) && !run.reusedTransfer
                 throw AdbException(
-                    if (run.reusedTransfer) tip
-                    else "$tip（文件已传至设备，重试将跳过传输）",
+                    if (withReuse) "$tip（文件已传至设备，重试将跳过传输）" else tip,
                 )
             }
             onProgress(TransferProgress(1f, "安装成功"))

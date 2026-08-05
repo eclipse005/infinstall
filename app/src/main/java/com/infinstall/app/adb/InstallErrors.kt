@@ -8,60 +8,68 @@ object InstallErrors {
     fun humanize(raw: String): String {
         val text = raw.trim()
         if (text.isEmpty()) return "安装失败，请重试"
-        val lower = text.lowercase()
+        val lower = text.lowercase().replace('_', ' ').replace('-', ' ')
 
         // Already friendly
-        if (text.startsWith("安装") && !lower.contains("failure") && !lower.contains("__ec")) {
+        if (text.startsWith("安装") && !text.lowercase().contains("failure") &&
+            !text.lowercase().contains("__ec")
+        ) {
             return text.lineSequence().first().trim()
         }
 
         return when {
-            "install_failed_update_incompatible" in lower ||
+            "no matching abis" in lower ||
+                "failed to extract native libraries" in lower ||
+                "install failed no matching abis" in lower ->
+                "此 APK 的 CPU 架构与设备不匹配（例如只有 x86，而电视/平板是 ARM）。" +
+                    "请换与设备架构一致的安装包，重试同一文件也无法安装。"
+
+            "install failed update incompatible" in lower ||
                 "signatures do not match" in lower ||
-                "signature" in lower && "conflict" in lower ->
+                ("signature" in lower && "conflict" in lower) ->
                 "与已安装版本签名不一致。请先在设备上卸载旧版，再安装。"
 
-            "install_failed_version_downgrade" in lower || "downgrade" in lower ->
+            "install failed version downgrade" in lower || "downgrade" in lower ->
                 "不能安装更低版本。请卸载旧版，或安装更高版本号的 APK。"
 
-            "install_failed_already_exists" in lower ->
+            "install failed already exists" in lower ->
                 "应用已存在。可先卸载旧版再装，或使用覆盖安装。"
 
-            "install_failed_insufficient_storage" in lower ||
+            "install failed insufficient storage" in lower ||
                 "not enough space" in lower ||
                 "no space" in lower ->
                 "设备存储空间不足，请清理后重试。"
 
-            "install_parse_failed" in lower ||
-                "invalid_apk" in lower ||
+            "install parse failed" in lower ||
+                "invalid apk" in lower ||
                 "not a valid zip" in lower ||
                 "bad.zip" in lower ->
                 "APK 无效或已损坏，请重新获取安装包。"
 
-            "install_failed_older_sdk" in lower || "older_sdk" in lower ->
+            "install failed older sdk" in lower || "older sdk" in lower ->
                 "设备系统版本过低，无法安装此应用。"
 
-            "install_failed_newer_sdk" in lower ->
+            "install failed newer sdk" in lower ->
                 "此 APK 要求更高系统版本。"
 
-            "install_failed_user_restricted" in lower ||
-                "install_failed_verification_failure" in lower ->
+            "install failed user restricted" in lower ||
+                "install failed verification failure" in lower ->
                 "设备限制安装（安全策略/家长控制/未允许未知来源）。"
 
-            "install_failed_aborted" in lower || "cancelled" in lower ->
+            "install failed aborted" in lower || "cancelled" in lower ->
                 "安装已取消。"
 
-            "install_failed_shared_user_incompatible" in lower ->
+            "install failed shared user incompatible" in lower ->
                 "与设备上其他应用共享用户冲突，无法安装。"
 
-            "install_failed_dexopt" in lower ->
+            "install failed dexopt" in lower ->
                 "设备优化安装包失败，可重启设备后重试。"
 
-            "install_failed_container_error" in lower ||
-                "install_failed_media_unavailable" in lower ->
+            "install failed container error" in lower ||
+                "install failed media unavailable" in lower ->
                 "存储位置不可用，请检查 SD 卡后重试。"
 
-            "install_failed_missing_shared_library" in lower ->
+            "install failed missing shared library" in lower ->
                 "缺少设备所需的系统库，无法安装。"
 
             "permission denied" in lower ->
@@ -77,10 +85,8 @@ object InstallErrors {
                 ).find(text)
                 if (bracket != null) {
                     val code = bracket.groupValues[1].trim()
-                    // Keep code so we can diagnose TV-specific failures
                     humanizeCode(code)
                 } else {
-                    // Never surface raw shell command lines (echo noise / mangled scripts)
                     if ("pm install" in lower || "echo" in lower || "__inf_" in lower) {
                         return "安装失败，请重试。若曾装过同名应用，请先卸载旧版。"
                     }
@@ -107,9 +113,30 @@ object InstallErrors {
         }
     }
 
+    /**
+     * True when re-pushing the same APK cannot fix the error (package/device mismatch).
+     * Used to avoid “重试将跳过传输” as if that would make install succeed.
+     */
+    fun isPermanentPackageError(raw: String): Boolean {
+        val lower = raw.lowercase().replace('_', ' ').replace('-', ' ')
+        return "no matching abis" in lower ||
+            "failed to extract native libraries" in lower ||
+            "update incompatible" in lower ||
+            "signatures do not match" in lower ||
+            "version downgrade" in lower ||
+            "older sdk" in lower ||
+            "newer sdk" in lower ||
+            "invalid apk" in lower ||
+            "parse failed" in lower ||
+            "missing shared library" in lower ||
+            "shared user incompatible" in lower
+    }
+
     private fun humanizeCode(code: String): String {
-        val c = code.uppercase()
+        val c = code.uppercase().replace(' ', '_')
         val tip = when {
+            "NO_MATCHING_ABIS" in c || "MATCHING_ABIS" in c ->
+                "CPU 架构不匹配，请换与设备一致的 APK（ARM/ARM64 等）"
             "UPDATE_INCOMPATIBLE" in c || "SIGNATURE" in c ->
                 "与已安装版本签名不一致，请先卸载旧版再装"
             "VERSION_DOWNGRADE" in c ->
@@ -122,6 +149,8 @@ object InstallErrors {
                 "APK 无效或损坏"
             "OLDER_SDK" in c ->
                 "设备系统版本过低"
+            "NEWER_SDK" in c ->
+                "此 APK 要求更高系统版本"
             "USER_RESTRICTED" in c || "VERIFICATION" in c ->
                 "设备限制安装"
             "ABORTED" in c ->
@@ -130,6 +159,6 @@ object InstallErrors {
                 "设备优化失败，可重启后再试"
             else -> null
         }
-        return if (tip != null) "安装失败：$tip（$code）" else "安装失败：$code"
+        return if (tip != null) "安装失败：$tip" else "安装失败：$code"
     }
 }
