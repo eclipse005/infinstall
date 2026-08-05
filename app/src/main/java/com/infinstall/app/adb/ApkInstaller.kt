@@ -104,9 +104,10 @@ class ApkInstaller(private val session: AdbSession) {
                 }
             }
             val raw = session.pmInstall(remote)
-            val ok = raw.contains("Success", ignoreCase = true) &&
-                !raw.contains("Failure", ignoreCase = true)
+            val lower = raw.lowercase()
+            val ok = "success" in lower && "failure" !in lower
             if (!ok) {
+                android.util.Log.e("ApkInstaller", "pm install failed raw=${raw.take(400)}")
                 throw AdbException(InstallErrors.humanize(raw.ifBlank { "安装无输出" }))
             }
         } finally {

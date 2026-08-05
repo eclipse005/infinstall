@@ -121,17 +121,59 @@ class AdbTransport(
     }
 
     /**
-     * `pm install` via the same shell channel (not a second OPEN style).
-     * Path must already be a short ASCII path under /data/local/tmp.
+     * Official one-shot: `adb shell pm install -r -t -d -g <path>`.
+     *
+     * Path **must** match [SAFE_TMP_APK] (ASCII, short) so OPEN destination
+     * stays under libadb's buffer limit and matches host `adb shell` semantics
+     * (process exits when pm finishes — no interactive stdin/marker).
      */
     fun pmInstall(remoteApkPath: String, timeoutMs: Long = 120_000): String {
-        require(remoteApkPath.startsWith("/data/local/tmp/")) {
-            "pm install path must be under /data/local/tmp"
+        require(SAFE_TMP_APK.matches(remoteApkPath)) {
+            "pm install path must be /data/local/tmp/ii<digits>.apk, got $remoteApkPath"
         }
-        // -r replace, -t allow test, -d allow downgrade (debug-friendly), -g grant runtime perms
-        val out = shell("pm install -r -t -d -g ${q(remoteApkPath)}", timeoutMs)
-        Log.i(TAG, "pmInstall out=${out.take(240)}")
+        // Exactly like: adb shell pm install -r -t -d -g /data/local/tmp/ii….apk
+        val cmd = "pm install -r -t -d -g $remoteApkPath"
+        val out = shellOneShotAscii(cmd, timeoutMs)
+        Log.i(TAG, "pmInstall out=${out.take(300)}")
         return out
+    }
+
+    /**
+     * Official one-shot shell service: OPEN `shell:<ascii-command>`.
+     * Only for short pure-ASCII commands (e.g. pm install on tmp path).
+     */
+    private fun shellOneShotAscii(command: String, timeoutMs: Long): String {
+        require(command.isNotEmpty() && command.all { it.code in 32..126 }) {
+            "one-shot shell must be printable ASCII"
+        }
+        val dest = "shell:$command"
+        require(dest.length < 90) {
+            "one-shot OPEN too long (${dest.length}): ${dest.take(60)}"
+        }
+        Log.i(TAG, "shellOneShot(${timeoutMs}ms) $command")
+        return timed(timeoutMs) { active ->
+            val stream = openStreamDest(dest).also { active.set(it) }
+            try {
+                // Command is in OPEN; remote runs it and closes when done — read to EOF
+                readUntilEof(stream, MAX_SHELL_OUT)
+            } finally {
+                closeQuiet(stream)
+                active.set(null)
+            }
+        }
+    }
+
+    private fun readUntilEof(stream: AdbStream, maxBytes: Int): String {
+        val input = stream.openInputStream()
+        val bos = ByteArrayOutputStream()
+        val buf = ByteArray(8 * 1024)
+        while (bos.size() < maxBytes) {
+            val n = input.read(buf)
+            if (n < 0) break
+            if (n == 0) continue
+            bos.write(buf, 0, n)
+        }
+        return bos.toString(StandardCharsets.UTF_8.name()).trim()
     }
 
     // ── sync ───────────────────────────────────────────────
@@ -239,17 +281,31 @@ class AdbTransport(
         if (!isSessionLive()) throw AdbException("未连接设备")
     }
 
-    /**
-     * Only short service names. Enforces design rule at the single open gate.
-     */
+    /** Interactive shell / sync only. */
     private fun openService(service: String): AdbStream {
         require(service == SERVICE_SHELL || service == SERVICE_SYNC) {
             "illegal OPEN destination: $service"
         }
+        return openStreamDest(service)
+    }
+
+    /**
+     * Open stream with validated destination.
+     * Allowed: `shell:`, `sync:`, or short pure-ASCII `shell:<command>` (one-shot).
+     */
+    private fun openStreamDest(dest: String): AdbStream {
+        val ok = when {
+            dest == SERVICE_SHELL || dest == SERVICE_SYNC -> true
+            dest.startsWith("shell:") &&
+                dest.length < 90 &&
+                dest.all { it.code in 32..126 } -> true
+            else -> false
+        }
+        require(ok) { "illegal OPEN destination: ${dest.take(48)}" }
         return try {
-            manager.openStream(service)
+            manager.openStream(dest)
         } catch (t: Throwable) {
-            Log.e(TAG, "openStream $service: ${t.javaClass.simpleName} ${t.message}")
+            Log.e(TAG, "openStream ${dest.take(60)}: ${t.javaClass.simpleName} ${t.message}")
             if (isConnectionDead(t)) {
                 onTransportDead(t.message ?: t.javaClass.simpleName)
             }
@@ -342,5 +398,8 @@ class AdbTransport(
         private const val SERVICE_SYNC = "sync:"
         private const val MAX_SHELL_OUT = 4 * 1024 * 1024
         private const val PING_TIMEOUT_MS = 6_000L
+
+        /** Only these temp names are used for pm install (ASCII, no spaces/quotes). */
+        val SAFE_TMP_APK: Regex = Regex("""^/data/local/tmp/ii\d+\.apk$""")
     }
 }

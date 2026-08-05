@@ -80,6 +80,10 @@ object InstallErrors {
                     // Keep code so we can diagnose TV-specific failures
                     humanizeCode(code)
                 } else {
+                    // Never surface raw shell command lines (echo noise / mangled scripts)
+                    if ("pm install" in lower || "echo" in lower || "__inf_" in lower) {
+                        return "安装失败，请重试。若曾装过同名应用，请先卸载旧版。"
+                    }
                     val cleaned = text.lineSequence()
                         .map { it.trim() }
                         .filter { line ->
@@ -87,14 +91,14 @@ object InstallErrors {
                                 !line.contains("__EC:", ignoreCase = true) &&
                                 !line.contains("__INF_", ignoreCase = true) &&
                                 !line.startsWith("pkg:") &&
-                                !line.contains("stdin:", ignoreCase = true) &&
-                                line.length < 200
+                                !line.contains("pm install", ignoreCase = true) &&
+                                line.length < 120
                         }
                         .take(2)
                         .joinToString(" ")
                     when {
                         cleaned.contains("Success", ignoreCase = true) -> "安装成功"
-                        cleaned.isNotBlank() && cleaned.length < 100 ->
+                        cleaned.isNotBlank() && cleaned.length < 80 ->
                             "安装失败：$cleaned"
                         else -> "安装失败，请重试（可先卸载旧版后再装）"
                     }
