@@ -618,7 +618,6 @@ private fun SheetAction(
 }
 
 @Composable
-@Composable
 private fun ToolbarIconButton(
     onClick: () -> Unit,
     contentDescription: String,
