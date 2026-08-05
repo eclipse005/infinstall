@@ -3,25 +3,24 @@ package com.infinstall.app.adb
 import com.infinstall.app.adb.model.AdbException
 import com.infinstall.app.adb.model.TransferProgress
 import com.infinstall.app.adb.session.AdbSession
+import com.infinstall.app.adb.transport.AdbTransport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.security.DigestInputStream
+import java.security.MessageDigest
 
 /**
- * Single official install recipe (same decomposition as host `adb install`):
+ * Official two-phase install (same as host `adb install`):
  *
- * ```
- * adb push  app.apk  /data/local/tmp/ii….apk
- * adb shell pm install -r -t -d -g /data/local/tmp/ii….apk
- * adb shell rm -f /data/local/tmp/ii….apk
- * ```
+ * 1. **Transfer** — `sync SEND` to `/data/local/tmp/ii….apk`
+ * 2. **Install** — `pm install -r -t -d -g …`
  *
- * Local installs run the whole recipe under **one** session serial lock
- * ([AdbSession.installLocalApk]) so no other ADB stream can interleave.
- *
- * Remote file: copy on device to tmp, then pm + rm (same end state).
+ * If transfer already succeeded and install failed, the remote file is **kept**.
+ * Retrying the same APK (same content hash) **skips transfer** and only runs pm.
+ * Remote tmp is deleted only after install Success (or session disconnect).
  */
 class ApkInstaller(private val session: AdbSession) {
 
@@ -35,9 +34,9 @@ class ApkInstaller(private val session: AdbSession) {
         onProgress(TransferProgress(0f, "准备中"))
         val local = File(cacheDir, "apk_${System.currentTimeMillis()}.apk")
         try {
-            FileOutputStream(local).use { input.copyTo(it) }
+            val contentKey = writeAndHash(input, local)
             if (local.length() <= 0L) throw AdbException("APK 为空")
-            installLocalFile(local, onProgress)
+            installLocalFile(local, contentKey, onProgress)
         } finally {
             local.delete()
         }
@@ -71,42 +70,59 @@ class ApkInstaller(private val session: AdbSession) {
 
     private suspend fun installLocalFile(
         local: File,
+        contentKey: String,
         onProgress: (TransferProgress) -> Unit,
     ) {
-        val size = local.length()
-        if (size <= 0L) throw AdbException("APK 为空")
-        val remote = "/data/local/tmp/ii${System.currentTimeMillis()}.apk"
-
         onProgress(TransferProgress(0.05f, "正在传输"))
         var lastPct = -1
-        var sawPushDone = false
+        var labeledInstall = false
         try {
-            // Entire push + pm + rm under one serial lock (see AdbSession.installLocalApk)
-            val raw = session.installLocalApk(local, remote) { sent, total ->
+            val run = session.installLocalApk(local, contentKey) { sent, total ->
                 val f = (sent.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
                 val pct = (f * 100).toInt()
-                if (pct != lastPct) {
-                    lastPct = pct
-                    if (f >= 0.999f && !sawPushDone) {
-                        sawPushDone = true
-                        onProgress(TransferProgress(0.90f, "正在安装（可能需要一分钟）"))
-                    } else if (!sawPushDone) {
-                        onProgress(TransferProgress(0.05f + f * 0.85f, "正在传输"))
-                    }
+                if (pct == lastPct) return@installLocalApk
+                lastPct = pct
+                // Reuse path: transport reports 100% in one shot before pm
+                if (f >= 0.999f && !labeledInstall) {
+                    labeledInstall = true
+                    onProgress(TransferProgress(0.90f, "已传输，正在安装"))
+                } else if (!labeledInstall) {
+                    onProgress(TransferProgress(0.05f + f * 0.85f, "正在传输"))
                 }
             }
-            val lower = raw.lowercase()
+            val lower = run.pmOutput.lowercase()
             val ok = "success" in lower && "failure" !in lower
             if (!ok) {
-                android.util.Log.e("ApkInstaller", "pm install failed raw=${raw.take(400)}")
-                throw AdbException(InstallErrors.humanize(raw.ifBlank { "安装无输出" }))
+                android.util.Log.e("ApkInstaller", "pm install failed raw=${run.pmOutput.take(400)}")
+                // Remote kept for retry — tell user clearly
+                val tip = InstallErrors.humanize(run.pmOutput.ifBlank { "安装无输出" })
+                throw AdbException(
+                    if (run.reusedTransfer) tip
+                    else "$tip（文件已传至设备，重试将跳过传输）",
+                )
             }
             onProgress(TransferProgress(1f, "安装成功"))
         } catch (t: Throwable) {
-            // installPushPmRm already tries rm; best-effort if we failed before that
-            runCatching { session.shell("rm -f ${session.q(remote)}") }
-            throw if (t is AdbException) t
-            else AdbException(InstallErrors.humanize(t.message ?: "安装失败"), t)
+            if (t is AdbException) throw t
+            val stage = generateSequence(t) { it.cause }
+                .filterIsInstance<AdbTransport.InstallStageException>()
+                .firstOrNull()
+            val base = InstallErrors.humanize(t.message ?: "安装失败")
+            throw AdbException(
+                if (stage != null) "$base（文件已传至设备，重试将跳过传输）" else base,
+                t,
+            )
         }
+    }
+
+    /** Write stream to [dest] while computing content key (size + sha256). */
+    private fun writeAndHash(input: InputStream, dest: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        DigestInputStream(input, md).use { din ->
+            FileOutputStream(dest).use { out -> din.copyTo(out) }
+        }
+        val size = dest.length()
+        val hex = md.digest().joinToString("") { b -> "%02x".format(b) }
+        return "$size:$hex"
     }
 }

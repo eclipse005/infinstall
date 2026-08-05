@@ -71,6 +71,13 @@ class AdbSession private constructor(context: Context) {
 
     private var linkWatchJob: Job? = null
 
+    /**
+     * Last APK that was fully pushed but not yet successfully installed.
+     * Cleared on success, disconnect, or when a different package is staged.
+     */
+    @Volatile
+    private var stagedApk: StagedRemoteApk? = null
+
     private val transport = AdbTransport(
         manager = manager,
         // I/O allowed while Connecting (handshake) or Connected — not while idle Disconnected
@@ -112,6 +119,7 @@ class AdbSession private constructor(context: Context) {
         lifecycleLock.withLock {
             stopLinkWatch()
             lastDropReason = null
+            clearStagedRemote(bestEffortRm = false)
             val h = host.trim()
             if (port !in 1..65535) throw AdbException("端口无效：$port")
             transport.managerDisconnect()
@@ -158,6 +166,7 @@ class AdbSession private constructor(context: Context) {
         lifecycleLock.withLock {
             stopLinkWatch()
             lastDropReason = null
+            clearStagedRemote(bestEffortRm = false) // link is about to go; skip remote rm
             transport.managerDisconnect()
             _state.value = SessionState.Disconnected
             Log.i(TAG, "disconnected by user")
@@ -217,6 +226,7 @@ class AdbSession private constructor(context: Context) {
     private fun dropBecauseLinkDead(fromTransportCallback: Boolean) {
         stopLinkWatch()
         lastDropReason = DROP_REASON_LINK_DEAD
+        clearStagedRemote(bestEffortRm = false)
         try {
             manager.disconnect()
         } catch (_: Exception) {
@@ -226,6 +236,18 @@ class AdbSession private constructor(context: Context) {
             _state.value = SessionState.Disconnected
         }
         Log.w(TAG, "session dropped (link dead) fromTransport=$fromTransportCallback")
+    }
+
+    private fun clearStagedRemote(bestEffortRm: Boolean) {
+        val s = stagedApk
+        stagedApk = null
+        if (bestEffortRm && s != null) {
+            runCatching {
+                transport.withSerial {
+                    transport.shell("rm -f ${transport.q(s.remotePath)}", 8_000)
+                }
+            }
+        }
     }
 
     suspend fun shell(command: String, timeoutMs: Long = 15_000): String =
@@ -298,30 +320,74 @@ class AdbSession private constructor(context: Context) {
     }
 
     /**
-     * Full `adb install` recipe under **one** serial bus hold:
-     * push → pm install → rm. Prevents link-watch and other ops from interleaving.
+     * Two-phase install under **one** serial bus hold:
+     * 1) push (skipped if [contentKey] matches a still-present staged remote)
+     * 2) pm install; rm remote **only on Success** so a failed install can retry without re-push.
      */
     suspend fun installLocalApk(
         local: File,
-        remoteApkPath: String,
+        contentKey: String,
         onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
-    ): String = withContext(Dispatchers.IO) {
+    ): AdbTransport.InstallRun = withContext(Dispatchers.IO) {
         requireConnected()
+        val size = local.length()
+        if (size <= 0L) throw AdbException("APK 为空")
+        val newRemote = "/data/local/tmp/ii${System.currentTimeMillis()}.apk"
+        val prev = stagedApk
+        val reuse = prev?.takeIf { it.contentKey == contentKey && it.size == size }?.remotePath
         try {
-            transport.withSerial {
+            val run = transport.withSerial {
+                // Switching to a different APK — drop the previous staged remote
+                if (prev != null && reuse == null) {
+                    runCatching {
+                        transport.shell("rm -f ${transport.q(prev.remotePath)}", 8_000)
+                    }
+                    stagedApk = null
+                }
                 transport.installPushPmRm(
                     local = local,
-                    remoteApkPath = remoteApkPath,
+                    newRemotePath = newRemote,
+                    reuseRemotePath = reuse,
                     onProgress = onProgress,
                 )
             }
+            val ok = "success" in run.pmOutput.lowercase() &&
+                "failure" !in run.pmOutput.lowercase()
+            if (ok) {
+                stagedApk = null
+            } else {
+                stagedApk = StagedRemoteApk(
+                    remotePath = run.remotePath,
+                    size = size,
+                    contentKey = contentKey,
+                )
+            }
+            run
         } catch (t: Throwable) {
+            val stage = generateSequence(t) { it.cause }
+                .filterIsInstance<AdbTransport.InstallStageException>()
+                .firstOrNull()
+            if (stage != null) {
+                stagedApk = StagedRemoteApk(
+                    remotePath = stage.remotePath,
+                    size = stage.size,
+                    contentKey = contentKey,
+                )
+                Log.i(TAG, "staged after pm error: ${stage.remotePath}")
+            }
             noteOpError(t)
             throw t
         }
     }
 
     fun q(path: String): String = transport.q(path)
+
+    /** Identity of a staged remote APK waiting for successful pm install. */
+    private data class StagedRemoteApk(
+        val remotePath: String,
+        val size: Long,
+        val contentKey: String,
+    )
 
     private fun requireConnected(): SessionState.Connected {
         val s = _state.value

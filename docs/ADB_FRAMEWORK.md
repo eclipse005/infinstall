@@ -22,16 +22,25 @@ UI → TvSession → AdbSession (唯一会话状态机)
                   └─ sync:  LIST/STAT/SEND/RECV
 ```
 
-## 安装（唯一路径）
+## 安装（两阶段，可复用传输）
+
+与 host `adb install` 相同，逻辑上明确拆成两步：
 
 ```
-【整段占有串行总线，禁止 link-watch / 其它 op 插队】
-sync SEND → /data/local/tmp/ii….apk
-shell:pm install -r -t -d -g /data/local/tmp/ii….apk   # one-shot OPEN
-rm 临时文件
+【整段占有串行总线】
+1. 传输  sync SEND → /data/local/tmp/ii….apk
+2. 安装  shell:pm install -r -t -d -g …
+3. 清理  仅 Success 后 rm；失败则保留远端文件
 ```
 
-远端 APK：设备内 `cp` 到 tmp，再 pm + rm。
+| 情况 | 行为 |
+|------|------|
+| 传输成功、安装失败 | **保留**远端 APK；会话内记住 contentKey（size+sha256） |
+| 再装**同一** APK | STAT 校验通过 → **跳过传输**，只跑 pm |
+| 安装成功 | rm 临时文件，清除 stage |
+| 断开连接 | 清除 stage 记录 |
+
+远端文件管理里的 APK：设备内 `cp` 到 tmp → pm → rm（源文件不动）。
 
 ### Stream closed（设计层处理）
 

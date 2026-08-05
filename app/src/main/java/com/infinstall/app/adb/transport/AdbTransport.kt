@@ -151,57 +151,118 @@ class AdbTransport(
     }
 
     /**
-     * Official install decomposition (host `adb install`), **one serial bus hold**:
+     * Result of the two-phase install recipe (push may be skipped when staged).
+     */
+    data class InstallRun(
+        val pmOutput: String,
+        /** True when remote APK was already on device and push was skipped */
+        val reusedTransfer: Boolean,
+        val remotePath: String,
+        /** True when remote tmp was removed (install succeeded) */
+        val cleanedRemote: Boolean,
+    )
+
+    /**
+     * Official two-phase install (host `adb install`), under caller's serial hold:
      *
-     * ```
-     * sync SEND  → remoteApkPath
-     * shell:pm install -r -t -d -g remoteApkPath
-     * shell: rm -f remoteApkPath
-     * ```
-     *
-     * Caller must already hold [withSerial] (or use [AdbSession] wrapper).
-     * Holding the bus for the whole recipe prevents link-watch / other ops from
-     * interleaving mid-install (a common source of "Stream closed" on install #2+).
+     * 1. **Transfer** — `sync SEND` unless [reuseRemotePath] already has the correct bytes
+     * 2. **Install** — `shell:pm install -r -t -d -g …`
+     * 3. **Cleanup** — `rm` **only on install Success** (keep staged file on failure for retry)
      */
     fun installPushPmRm(
         local: File,
-        remoteApkPath: String,
+        /** Path to use when a new push is required */
+        newRemotePath: String,
+        /** If set and STAT size matches local, skip push and install from this path */
+        reuseRemotePath: String? = null,
         onProgress: (sent: Long, total: Long) -> Unit,
         pushTimeoutMs: Long = 300_000,
         pmTimeoutMs: Long = 180_000,
-    ): String {
-        require(SAFE_TMP_APK.matches(remoteApkPath)) {
-            "install path must be /data/local/tmp/ii<digits>.apk, got $remoteApkPath"
+    ): InstallRun {
+        require(SAFE_TMP_APK.matches(newRemotePath)) {
+            "install path must be /data/local/tmp/ii<digits>.apk, got $newRemotePath"
+        }
+        if (reuseRemotePath != null) {
+            require(SAFE_TMP_APK.matches(reuseRemotePath)) {
+                "reuse path must be /data/local/tmp/ii<digits>.apk, got $reuseRemotePath"
+            }
         }
         ensureLive()
         checkCancel()
         val expected = local.length()
         if (!local.isFile || expected <= 0L) throw AdbException("本地文件无效")
 
-        // Parent /data/local/tmp always exists on device; skip mkdir to avoid extra shell churn
-        timed(pushTimeoutMs) { active ->
-            withSync(active) { sync ->
-                sync.push(
-                    local = local,
-                    remotePath = remoteApkPath,
-                    onProgress = onProgress,
-                    checkCancel = { checkCancel() },
-                )
+        var remote = newRemotePath
+        var reused = false
+
+        // ── Phase 1: transfer (or reuse staged) ──
+        if (reuseRemotePath != null) {
+            val st = runCatching { syncStat(reuseRemotePath, 15_000) }.getOrNull()
+            if (st != null && st.size == expected && st.size > 0L) {
+                remote = reuseRemotePath
+                reused = true
+                onProgress(expected, expected)
+                Log.i(TAG, "install reuse staged $remote size=$expected")
             }
         }
-        val st = syncStat(remoteApkPath, 15_000)
-        if (st.size > 0L && st.size != expected) {
-            runCatching { shell("rm -f ${q(remoteApkPath)}", 8_000) }
-            throw AdbException("传输不完整：本地 ${expected}B，远端 ${st.size}B")
+
+        if (!reused) {
+            // Different package than last stage — drop the old remote if any
+            if (reuseRemotePath != null && reuseRemotePath != newRemotePath) {
+                runCatching { shell("rm -f ${q(reuseRemotePath)}", 8_000) }
+            }
+            timed(pushTimeoutMs) { active ->
+                withSync(active) { sync ->
+                    sync.push(
+                        local = local,
+                        remotePath = newRemotePath,
+                        onProgress = onProgress,
+                        checkCancel = { checkCancel() },
+                    )
+                }
+            }
+            val st = syncStat(newRemotePath, 15_000)
+            if (st.size > 0L && st.size != expected) {
+                runCatching { shell("rm -f ${q(newRemotePath)}", 8_000) }
+                throw AdbException("传输不完整：本地 ${expected}B，远端 ${st.size}B")
+            }
+            remote = newRemotePath
         }
 
+        // Phase 1 done — remote bytes are good. Phase 2 may fail; keep remote for retry.
+        // ── Phase 2: pm install ──
         val raw = try {
-            pmInstall(remoteApkPath, pmTimeoutMs)
-        } finally {
-            runCatching { shell("rm -f ${q(remoteApkPath)}", 8_000) }
+            pmInstall(remote, pmTimeoutMs)
+        } catch (t: Throwable) {
+            // Staged file left on device; caller records remotePath via [InstallStageException]
+            throw InstallStageException(remotePath = remote, size = expected, cause = t)
         }
-        return raw
+        val ok = "success" in raw.lowercase() && "failure" !in raw.lowercase()
+
+        // ── Phase 3: rm only on success ──
+        var cleaned = false
+        if (ok) {
+            runCatching { shell("rm -f ${q(remote)}", 8_000) }
+            cleaned = true
+        } else {
+            Log.i(TAG, "install pm failed — keep staged $remote for retry")
+        }
+        return InstallRun(
+            pmOutput = raw,
+            reusedTransfer = reused,
+            remotePath = remote,
+            cleanedRemote = cleaned,
+        )
     }
+
+    /**
+     * Push finished, pm (or post-push step) failed — remote APK is still on device for reuse.
+     */
+    class InstallStageException(
+        val remotePath: String,
+        val size: Long,
+        cause: Throwable,
+    ) : Exception(cause.message ?: "安装阶段失败", cause)
 
     /**
      * Official one-shot: `adb shell pm install -r -t -d -g <path>`.
@@ -456,6 +517,7 @@ class AdbTransport(
 
     private fun mapIo(t: Throwable): Throwable {
         if (t is TransferCancelledException || t is AdbException) return t
+        if (t is InstallStageException) return t
         val m = generateSequence(t) { it.cause }
             .joinToString(" ") { listOfNotNull(it.javaClass.simpleName, it.message).joinToString(" ") }
             .lowercase()
@@ -524,6 +586,7 @@ class AdbTransport(
             when (c) {
                 is AdbException -> throw c
                 is TransferCancelledException -> throw c
+                is InstallStageException -> throw c
                 else -> throw mapIo(c)
             }
         }
