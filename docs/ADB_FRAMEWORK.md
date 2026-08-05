@@ -37,3 +37,13 @@ shell: rm
 3. 操作失败 ≠ 断会话  
 4. UI `connected` 只跟 `SessionState`  
 5. 文件元数据/传输只用 sync  
+
+## 轻探活（keepalive）
+
+- 连接成功后启动；用户断开 / 会话死亡时停止  
+- 每 **12s** 空闲探测：`tryLightPing`  
+  - 总线忙（正在传/装/列）→ **Busy，视为仍存活**，不累计失败  
+  - `echo __PING_OK__` 成功 → 清零失败计数  
+  - 失败 → 计数 +1；**连续 2 次** 才 `Disconnected`  
+  - 连接级死亡（reset 等）→ 立即断开  
+- UI 提示：`设备端调试已关闭或网络中断，请重新连接`  

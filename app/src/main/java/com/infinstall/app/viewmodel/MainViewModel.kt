@@ -139,15 +139,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     SessionState.Disconnected -> {
                         _ui.update { cur ->
                             val wasConnected = cur.connected
+                            val drop = session.lastDropReason
                             cur.copy(
                                 connected = false,
                                 connectedEndpoint = null,
                                 connecting = false,
                                 pairing = false,
+                                installing = if (wasConnected) false else cur.installing,
+                                transferring = if (wasConnected) false else cur.transferring,
+                                transferProgress = if (wasConnected) null else cur.transferProgress,
+                                transferLabel = if (wasConnected) null else cur.transferLabel,
                                 connectBanner = when {
                                     userConnectInFlight -> cur.connectBanner
-                                    wasConnected -> cur.connectBanner ?: "连接已结束"
+                                    wasConnected && !drop.isNullOrBlank() -> drop
+                                    wasConnected -> "连接已结束"
                                     else -> cur.connectBanner
+                                },
+                                errorMessage = when {
+                                    userConnectInFlight -> cur.errorMessage
+                                    wasConnected && !drop.isNullOrBlank() -> drop
+                                    else -> cur.errorMessage
+                                },
+                                tab = if (wasConnected && !userConnectInFlight) {
+                                    MainTab.Connect
+                                } else {
+                                    cur.tab
                                 },
                             )
                         }

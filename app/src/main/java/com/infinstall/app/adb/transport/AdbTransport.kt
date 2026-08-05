@@ -59,6 +59,35 @@ class AdbTransport(
 
     suspend fun <T> withSerial(block: () -> T): T = mutex.withLock { block() }
 
+    enum class LightPing {
+        /** Mutex busy — real op in progress; treat as alive */
+        Busy,
+        /** Probe succeeded */
+        Alive,
+        /** Soft failure (retry streak) */
+        Fail,
+        /** Connection-level death */
+        Dead,
+    }
+
+    /**
+     * Non-blocking keepalive probe. Skips if another op holds the mutex.
+     * Must not be called while already holding [mutex].
+     */
+    fun tryLightPing(): LightPing {
+        if (!mutex.tryLock()) return LightPing.Busy
+        return try {
+            if (!isSessionLive()) return LightPing.Dead
+            val out = shell("echo __PING_OK__", PING_TIMEOUT_MS)
+            if (out.contains("__PING_OK__")) LightPing.Alive else LightPing.Fail
+        } catch (t: Throwable) {
+            Log.w(TAG, "lightPing: ${t.javaClass.simpleName} ${t.message}")
+            if (isConnectionDead(t)) LightPing.Dead else LightPing.Fail
+        } finally {
+            mutex.unlock()
+        }
+    }
+
     // ── shell ──────────────────────────────────────────────
 
     /**
@@ -312,5 +341,6 @@ class AdbTransport(
         private const val SERVICE_SHELL = "shell:"
         private const val SERVICE_SYNC = "sync:"
         private const val MAX_SHELL_OUT = 4 * 1024 * 1024
+        private const val PING_TIMEOUT_MS = 6_000L
     }
 }

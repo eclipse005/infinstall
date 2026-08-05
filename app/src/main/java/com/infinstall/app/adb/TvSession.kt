@@ -22,6 +22,8 @@ class TvSession(appContext: Context) {
     val host: String? get() = session.host
     val port: Int? get() = session.port
     val isConnected: Boolean get() = session.isConnected
+    /** Set when session drops without user disconnect (e.g. keepalive). */
+    val lastDropReason: String? get() = session.lastDropReason
 
     fun requestCancel() = session.requestCancel()
     fun clearCancel() = session.clearCancel()
