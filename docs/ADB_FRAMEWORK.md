@@ -38,14 +38,22 @@ shell: rm
 4. UI `connected` 只跟 `SessionState`  
 5. 文件元数据/传输只用 sync  
 
-## 轻探活（keepalive）
+## 心跳（keepalive）
 
-- 连接成功后启动；用户断开 / 会话死亡时停止  
-- 每 **5s** 空闲探测：`tryLightPing`  
-  - 总线忙（正在传/装/列）→ **Busy**：本轮跳过；**不**清失败计数；只刷新 stale 时钟（避免长安装误断）  
-  - one-shot `shell:echo __PING_OK__` 成功 → Alive，清零失败计数  
-  - 软失败 → 计数 +1；**连续 2 次** → `Disconnected`  
-  - 对端死亡 / `manager` 已断（reset、SSL、socket…）→ **立即**断开  
-  - **25s** 无任何 Alive/Busy 刷新 → stale 强制断开（半开 TCP）  
-- UI 提示：`设备端调试已关闭或网络中断，请重新连接`  
-- 顶栏 `已连接` **只**跟 `SessionState`；断开会变为 `未连接`
+连接成功后后台协程循环；用户断开 / 会话死亡时停止。
+
+每 **5s** 一轮：
+
+1. **TCP 探端口** `host:port`（2s 超时）  
+   - 平板关掉无线调试后端口通常不再监听 → 连续失败即可断  
+   - 不依赖旧 ADB TLS 是否半开假活  
+2. **ADB one-shot** `shell:echo __PING_OK__`（总线空闲时）  
+   - 确认会话仍能说话  
+   - 总线忙（安装/传输）且端口仍开 → 本轮算健康  
+
+规则：
+
+- 软失败（TCP 或 ADB）连续 **2** 次 → `Disconnected`  
+- ADB 判定对端已死 → **立即**断开  
+- **25s** 无健康轮次 → stale 强制断开  
+- UI：`设备端调试已关闭或网络中断，请重新连接`；顶栏变 `未连接`
