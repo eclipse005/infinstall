@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -61,6 +63,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -345,47 +348,89 @@ fun FilesScreen(
                 }
             }
             item {
+                // Unified icon toolbar — equal IconButtons, aligned baseline
+                val atRoot = state.remotePath == "/" || state.remotePath.isBlank()
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = MinTouch),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    OutlinedButton(
-                        onClick = onGoUp,
-                        modifier = Modifier.heightIn(min = MinTouch),
-                    ) { Text("上级") }
-                    OutlinedButton(
-                        onClick = onRefresh,
-                        enabled = !state.filesLoading && !state.transferring,
-                        modifier = Modifier.heightIn(min = MinTouch),
-                    ) {
-                        if (state.filesLoading) {
-                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                        } else {
-                            Icon(Icons.Default.Refresh, null, Modifier.size(18.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        ToolbarIconButton(
+                            onClick = onGoUp,
+                            enabled = !atRoot,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "上级目录",
+                        )
+                        ToolbarIconButton(
+                            onClick = onRefresh,
+                            enabled = !state.filesLoading && !state.transferring,
+                            contentDescription = "刷新",
+                        ) {
+                            if (state.filesLoading) {
+                                CircularProgressIndicator(
+                                    Modifier.size(22.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(
+                                    Icons.Default.Refresh,
+                                    contentDescription = null,
+                                    Modifier.size(24.dp),
+                                )
+                            }
                         }
-                        Spacer(Modifier.width(4.dp))
-                        Text("刷新")
+                        androidx.compose.foundation.layout.Box {
+                            ToolbarIconButton(
+                                onClick = { showSortMenu = true },
+                                imageVector = Icons.Default.Sort,
+                                contentDescription = "排序：${sortLabel(state.fileSort)}",
+                            )
+                            DropdownMenu(
+                                expanded = showSortMenu,
+                                onDismissRequest = { showSortMenu = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("名称 A→Z") },
+                                    onClick = {
+                                        showSortMenu = false
+                                        onSort(FileSort.NameAsc)
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("名称 Z→A") },
+                                    onClick = {
+                                        showSortMenu = false
+                                        onSort(FileSort.NameDesc)
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("大小") },
+                                    onClick = {
+                                        showSortMenu = false
+                                        onSort(FileSort.SizeDesc)
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("修改时间") },
+                                    onClick = {
+                                        showSortMenu = false
+                                        onSort(FileSort.TimeDesc)
+                                    },
+                                )
+                            }
+                        }
                     }
-                    BoxSort(
-                        sort = state.fileSort,
-                        expanded = showSortMenu,
-                        onExpand = { showSortMenu = true },
-                        onDismiss = { showSortMenu = false },
-                        onSort = {
-                            showSortMenu = false
-                            onSort(it)
-                        },
-                    )
-                    Spacer(Modifier.weight(1f))
-                    IconButton(
+                    ToolbarIconButton(
                         onClick = {
                             newFolderName = ""
                             showNewFolder = true
                         },
-                    ) {
-                        Icon(Icons.Default.CreateNewFolder, contentDescription = "新建文件夹")
-                    }
+                        imageVector = Icons.Default.CreateNewFolder,
+                        contentDescription = "新建文件夹",
+                    )
                 }
             }
             item {
@@ -573,31 +618,36 @@ private fun SheetAction(
 }
 
 @Composable
-private fun BoxSort(
-    sort: FileSort,
-    expanded: Boolean,
-    onExpand: () -> Unit,
-    onDismiss: () -> Unit,
-    onSort: (FileSort) -> Unit,
+@Composable
+private fun ToolbarIconButton(
+    onClick: () -> Unit,
+    contentDescription: String,
+    enabled: Boolean = true,
+    imageVector: ImageVector? = null,
+    content: (@Composable () -> Unit)? = null,
 ) {
-    Row {
-        OutlinedButton(onClick = onExpand, modifier = Modifier.heightIn(min = MinTouch)) {
-            Text(
-                when (sort) {
-                    FileSort.NameAsc -> "名称"
-                    FileSort.NameDesc -> "名称↓"
-                    FileSort.SizeDesc -> "大小"
-                    FileSort.TimeDesc -> "时间"
-                },
+    IconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.size(MinTouch),
+    ) {
+        if (content != null) {
+            content()
+        } else if (imageVector != null) {
+            Icon(
+                imageVector = imageVector,
+                contentDescription = contentDescription,
+                modifier = Modifier.size(24.dp),
             )
         }
-        DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
-            DropdownMenuItem(text = { Text("名称 A→Z") }, onClick = { onSort(FileSort.NameAsc) })
-            DropdownMenuItem(text = { Text("名称 Z→A") }, onClick = { onSort(FileSort.NameDesc) })
-            DropdownMenuItem(text = { Text("大小") }, onClick = { onSort(FileSort.SizeDesc) })
-            DropdownMenuItem(text = { Text("修改时间") }, onClick = { onSort(FileSort.TimeDesc) })
-        }
     }
+}
+
+private fun sortLabel(sort: FileSort): String = when (sort) {
+    FileSort.NameAsc -> "名称 A→Z"
+    FileSort.NameDesc -> "名称 Z→A"
+    FileSort.SizeDesc -> "大小"
+    FileSort.TimeDesc -> "修改时间"
 }
 
 @Composable
